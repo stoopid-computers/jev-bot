@@ -9,6 +9,49 @@ export type Target = Readonly<{
   windowId: number;
 }>;
 
+/** Exact window or primary display selected for screenshot-grounded input. */
+export type VisualTarget = Target | Readonly<{ displayId: "primary" }>;
+
+/** One host-chosen input grounded in the latest target screenshot. */
+export type VisualAction = Readonly<
+  | {
+      /** Send a key or shortcut to the selected window's focused control. */
+      kind: "press_key";
+      /** Exact window receiving the key. Desktop keyboard input is unsupported. */
+      target: Target;
+      /** One key or chord, such as Return or Cmd+K. */
+      key: string;
+    }
+  | ({
+      /** Screenshot that supplies the coordinate space. */
+      target: VisualTarget;
+      /** Horizontal pixel coordinate in the returned PNG. */
+      x: number;
+      /** Vertical pixel coordinate in the returned PNG. */
+      y: number;
+    } & (
+      | { /** Click once with the left button. */ kind: "click" }
+      | {
+          /** Hover within an exact window, or move the pointer on an explicit desktop. */
+          kind: "move";
+        }
+      | {
+          /** Click the field and insert exact caller-provided text. */
+          kind: "type_text";
+          /** Text to insert, at most 8,000 characters. */
+          text: string;
+        }
+      | {
+          /** Send wheel input at the chosen point. */
+          kind: "scroll";
+          /** Direction in which to scroll the content. */
+          direction: "up" | "down" | "left" | "right";
+          /** Wheel notches from 1 to 50. Defaults to 3. */
+          amount?: number;
+        }
+    ))
+>;
+
 /** A control returned by a native accessibility observation. */
 export type Element = Readonly<{
   /** Opaque native handle for actions against this observed control. */
@@ -84,11 +127,11 @@ export type NativeAction = Readonly<
       value: string;
     }
   | {
-      /** Send one supported navigation or editing key to the window. */
+      /** Send one supported key or shortcut to the window. */
       kind: "press_key";
       /** Window receiving the key. */
       target: Target;
-      /** Lowercase key name, such as `return`, `tab`, or `escape`. */
+      /** Key or chord, such as `return`, `tab`, or `Cmd+K`. */
       key: string;
     }
 >;
@@ -128,6 +171,28 @@ export interface Driver {
   observe(target: Target, query?: string): Promise<Observation>;
   /** Capture the window as base64 PNG data with MIME type `image/png`. */
   screenshot?(target: Target): Promise<{ data: string; mimeType: string }>;
+  /** Bring this exact window forward and verify its native focus and order. */
+  activate?(target: Target): Promise<JsonObject>;
+  /** Capture a window or the primary display for host-chosen pixel input. */
+  visualScreenshot?(
+    target: VisualTarget,
+  ): Promise<{ data: string; mimeType: string }>;
+  /**
+   * Attempt background window input, or an explicit desktop click or move.
+   * The host must inspect a fresh screenshot to verify the resulting change.
+   */
+  visualExecute?(action: VisualAction): Promise<JsonObject>;
+  /** Configure this connection's cursor appearance and movement without input. */
+  configureCursor?(options: {
+    /** ID of an already-installed native cursor theme. */
+    themeId?: string;
+    /** Glide duration from 0 to 5,000 milliseconds; zero uses speed-based motion. */
+    glideDurationMs?: number;
+    /** Pause after a click, from 0 to 5,000 milliseconds. */
+    dwellAfterClickMs?: number;
+    /** Idle visibility interval from 0 to 60,000 milliseconds. */
+    idleHideMs?: number;
+  }): Promise<JsonObject>;
   /**
    * Perform one input operation and return its receipt.
    * Set `executed: true` only for confirmed execution; report stale targets

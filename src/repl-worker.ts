@@ -38,10 +38,18 @@ function target(id: string) {
       );
       return { ...result, screenshot: new Uint8Array(result.screenshot) };
     },
-    click: (element: number | string) => call("click", [id, element]),
+    click: (element: number | string | readonly [number, number]) =>
+      call("click", [id, element]),
+    move: (point: readonly [number, number]) => call("move", [id, point]),
     setValue: (element: number | string, text: string) =>
       call("setValue", [id, element, text]),
-    typeText: (text: string) => call("typeText", [id, text]),
+    typeText: (text: string, options?: unknown) =>
+      call("typeText", [id, text, options]),
+    scroll: (
+      point: readonly [number, number],
+      direction: string,
+      amount?: number,
+    ) => call("scroll", [id, point, direction, amount]),
     pressKey: (key: string) => call("pressKey", [id, key]),
     act: (goal: string, options?: unknown) => call("act", [id, goal, options]),
   });
@@ -73,12 +81,14 @@ const repl = start({
 });
 Object.assign(repl.context, {
   cua: Object.freeze({
+    configureCursor: (options: unknown) => call("configureCursor", [options]),
     getState: (options?: unknown) => call("getState", [options]),
     listApps: (options?: unknown) => call("listApps", [options]),
-    getApp: async (name: string) =>
-      target(await call<string>("getApp", [name])),
-    getWindow: async (pid: number, windowId: number) =>
-      target(await call<string>("getWindow", [pid, windowId])),
+    getApp: async (name: string, options?: unknown) =>
+      target(await call<string>("getApp", [name, options])),
+    getWindow: async (pid: number, windowId: number, options?: unknown) =>
+      target(await call<string>("getWindow", [pid, windowId, options])),
+    getDesktop: async () => target(await call<string>("getDesktop")),
   }),
   nodeRepl: Object.freeze({
     write: (value: unknown) =>

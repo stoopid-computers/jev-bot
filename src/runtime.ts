@@ -1,9 +1,16 @@
-import { connectDriver } from "./driver.js";
+import { connectDriver, DriverConnectionError } from "./driver.js";
 import { DesktopEngine } from "./engine.js";
 import { createChooser } from "./provider.js";
 import { ComputerRepl } from "./repl.js";
 import type { ReplRuntimePort } from "./server.js";
-import type { Choose, Driver, NativeAction, Target } from "./types.js";
+import type {
+  Choose,
+  Driver,
+  NativeAction,
+  Target,
+  VisualAction,
+  VisualTarget,
+} from "./types.js";
 
 /** Optional adapters for embedding or testing a session. */
 export interface SessionOptions {
@@ -25,26 +32,58 @@ export interface ComputerSession extends ReplRuntimePort {
 /** Connect to Cua Driver on the first desktop call, keeping one connection. */
 export class LazyDriver implements Driver {
   private connection?: Promise<Driver>;
+  private closed = false;
+  private closing?: Promise<void>;
+  constructor(
+    private readonly connect: () => Promise<Driver> = connectDriver,
+  ) {}
   private get(): Promise<Driver> {
-    return (this.connection ??= connectDriver().catch((error: unknown) => {
+    if (this.closed)
+      return Promise.reject(new Error("Driver connection is closed."));
+    return (this.connection ??= this.connect().catch((error: unknown) => {
       this.connection = undefined;
       throw error;
     }));
   }
+  private async read<T>(operation: (driver: Driver) => Promise<T>): Promise<T> {
+    const connection = this.get();
+    const driver = await connection;
+    try {
+      return await operation(driver);
+    } catch (error) {
+      if (!(error instanceof DriverConnectionError) || this.closed) throw error;
+      if (this.connection === connection) {
+        this.connection = undefined;
+        await driver.close().catch(() => {});
+      }
+      // One retry for a read only, never recursion or an input replay.
+      return operation(await this.get());
+    }
+  }
   /** List available windows, opening the native connection if needed. */
   async listWindows() {
-    return (await this.get()).listWindows();
+    return this.read((driver) => driver.listWindows());
   }
   /** List running apps, or reject if the driver lacks app discovery. */
   async listApps() {
-    const driver = await this.get();
-    if (!driver.listApps)
-      throw new Error("Driver does not expose app discovery.");
-    return driver.listApps();
+    return this.read((driver) => {
+      if (!driver.listApps)
+        throw new Error("Driver does not expose app discovery.");
+      return driver.listApps();
+    });
   }
   /** Read accessibility state, optionally filtered by a query. */
   async observe(target: Target, query?: string) {
-    return (await this.get()).observe(target, query);
+    return this.read((driver) => driver.observe(target, query));
+  }
+  /** Configure this connection's cursor without moving or clicking. */
+  async configureCursor(
+    options: Parameters<NonNullable<Driver["configureCursor"]>>[0],
+  ) {
+    const driver = await this.get();
+    if (!driver.configureCursor)
+      throw new Error("Driver does not expose cursor configuration.");
+    return driver.configureCursor(options);
   }
   /** Perform one native input operation and return its receipt. */
   async execute(action: NativeAction) {
@@ -52,14 +91,40 @@ export class LazyDriver implements Driver {
   }
   /** Capture a window, or reject if the driver lacks screenshot support. */
   async screenshot(target: Target) {
+    return this.read((driver) => {
+      if (!driver.screenshot)
+        throw new Error("Driver does not expose screenshots.");
+      return driver.screenshot(target);
+    });
+  }
+  /** Bring the exact selected window to the foreground and verify it. */
+  async activate(target: Target) {
     const driver = await this.get();
-    if (!driver.screenshot)
-      throw new Error("Driver does not expose screenshots.");
-    return driver.screenshot(target);
+    if (!driver.activate)
+      throw new Error("Driver does not expose window activation.");
+    return driver.activate(target);
+  }
+  /** Capture an explicitly selected visual window or primary desktop. */
+  async visualScreenshot(target: VisualTarget) {
+    return this.read((driver) => {
+      if (!driver.visualScreenshot)
+        throw new Error("Driver does not expose visual capture.");
+      return driver.visualScreenshot(target);
+    });
+  }
+  /** Send one screenshot-grounded input without automatic retries. */
+  async visualExecute(action: VisualAction) {
+    const driver = await this.get();
+    if (!driver.visualExecute)
+      throw new Error("Driver does not expose visual input.");
+    return driver.visualExecute(action);
   }
   /** Close an existing connection without opening one. */
-  async close() {
-    await (await this.connection)?.close();
+  close() {
+    this.closed = true;
+    return (this.closing ??= (async () => {
+      await (await this.connection)?.close();
+    })());
   }
 }
 

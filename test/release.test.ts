@@ -3,23 +3,19 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import {
   checkPublishedVersions,
-  compareVersions,
   ensureReleaseAssets,
   fileManifest,
-  nextMetadata,
   npmTag,
-  packageName,
-  parseVersion,
   registryJson,
-  validateBranch,
-  validateMetadata,
   verifyJsrVersion,
   verifyNpmArchiveMetadata,
   verifyNpmVersion,
 } from "../scripts/release-lib.mjs";
+
+const packageName = "@compootor/jev-bot";
 
 function metadata(version = "0.1.0") {
   return [
@@ -36,69 +32,146 @@ function metadata(version = "0.1.0") {
   ];
 }
 
-void test("release versions use canonical stable or rc SemVer", () => {
-  for (const value of ["0.0.0", "1.2.3", "10.20.30-rc.0", "1.0.0-rc.12"])
-    assert.equal(parseVersion(value).version, value);
-  for (const value of [
-    "v1.0.0",
-    "01.0.0",
-    "1.2",
-    "1.2.3-rc.01",
-    "1.2.3-rc",
-    "1.2.3-beta.1",
-    "1.2.3+build.1",
-    "1.2.3\n",
-    "1.2.3; echo bad",
-  ])
-    assert.throws(() => parseVersion(value));
-});
+async function releaseFixture(
+  t: TestContext,
+  version = "0.1.0",
+  branch = "release/0.1",
+) {
+  const directory = await mkdtemp(join(tmpdir(), "jev-bot-release-cli-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const env = { ...process.env };
+  for (const name of Object.keys(env))
+    if (name.startsWith("GITHUB_") || name.startsWith("GIT_")) delete env[name];
+  const git = (...args: string[]) =>
+    execFileSync("git", args, {
+      cwd: directory,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const names = ["package.json", "package-lock.json", "jsr.json"];
+  const writeMetadata = async (values: ReturnType<typeof metadata>) => {
+    for (const [index, name] of names.entries())
+      await writeFile(join(directory, name), JSON.stringify(values[index]));
+  };
+  await mkdir(join(directory, "scripts"));
+  for (const name of ["release.mjs", "release-lib.mjs"])
+    await cp(
+      new URL(`../scripts/${name}`, import.meta.url),
+      join(directory, "scripts", name),
+    );
+  await writeMetadata(metadata(version));
+  git("init", "-b", branch);
+  git("add", ".");
+  git(
+    "-c",
+    "user.name=Release test",
+    "-c",
+    "user.email=release@example.test",
+    "commit",
+    "-m",
+    "fixture",
+  );
+  return {
+    git,
+    writeMetadata,
+    readMetadata: () =>
+      Promise.all(
+        names.map(async (name) =>
+          JSON.parse(await readFile(join(directory, name), "utf8")),
+        ),
+      ),
+    release: (...args: string[]) => {
+      const result = spawnSync(
+        process.execPath,
+        [join(directory, "scripts/release.mjs"), ...args],
+        { cwd: directory, env, encoding: "utf8", timeout: 5_000 },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.signal, null);
+      return result;
+    },
+  };
+}
 
-void test("release ordering handles multi-digit numbers and rc promotion", () => {
-  for (const [a, b] of [
-    ["0.1.10", "0.1.9"],
-    ["1.0.0-rc.10", "1.0.0-rc.9"],
-    ["1.0.0", "1.0.0-rc.99"],
-    ["2.0.0-rc.1", "1.99.99"],
-  ]) {
-    assert.equal(compareVersions(a, b), 1);
-    assert.equal(compareVersions(b, a), -1);
+void test("release CLI accepts canonical stable and rc versions", async (t) => {
+  for (const [version, branch] of [
+    ["0.0.0", "release/0.0"],
+    ["1.2.3", "release/1.2"],
+    ["10.20.30-rc.0", "release/10.20"],
+    ["1.0.0-rc.12", "release/1.0"],
+  ] as const) {
+    const fixture = await releaseFixture(t, version, branch);
+    const checked = fixture.release("check", version);
+    assert.equal(checked.status, 0, checked.stderr);
   }
-  assert.equal(compareVersions("0.1.0", "0.1.0"), 0);
+  const fixture = await releaseFixture(t);
+  for (const [version, branch] of [
+    ["v1.0.0", "release/1.0"],
+    ["01.0.0", "release/01.0"],
+    ["1.2", "release/1.2"],
+    ["1.2.3-rc.01", "release/1.2"],
+    ["1.2.3-rc", "release/1.2"],
+    ["1.2.3-beta.1", "release/1.2"],
+    ["1.2.3+build.1", "release/1.2"],
+    ["1.2.3\n", "release/1.2"],
+    ["1.2.3; echo bad", "release/1.2"],
+  ] as const) {
+    fixture.git("switch", "-C", branch);
+    await fixture.writeMetadata(metadata(version));
+    assert.notEqual(fixture.release("check", version).status, 0, version);
+  }
 });
 
-void test("only the matching release line is accepted", () => {
-  assert.equal(validateBranch("1.2.3-rc.1", "release/1.2").line, "1.2");
+void test("release CLI checks version ordering and leaves rejected preparations untouched", async (t) => {
+  for (const [before, after, branch] of [
+    ["0.1.9", "0.1.10", "release/0.1"],
+    ["1.0.0-rc.9", "1.0.0-rc.10", "release/1.0"],
+    ["1.0.0-rc.99", "1.0.0", "release/1.0"],
+    ["1.99.99", "2.0.0-rc.1", "release/2.0"],
+  ] as const) {
+    const fixture = await releaseFixture(t, before, branch);
+    const rejected = fixture.release("prepare", before);
+    assert.notEqual(rejected.status, 0, before);
+    assert.deepEqual(await fixture.readMetadata(), metadata(before));
+    const prepared = fixture.release("prepare", after);
+    assert.equal(prepared.status, 0, prepared.stderr);
+    assert.deepEqual(await fixture.readMetadata(), metadata(after));
+    assert.equal(fixture.git("rev-list", "--count", "HEAD"), "1");
+  }
+  const fixture = await releaseFixture(t, "0.1.10");
+  assert.notEqual(fixture.release("prepare", "0.1.9").status, 0);
+  assert.deepEqual(await fixture.readMetadata(), metadata("0.1.10"));
+});
+
+void test("release CLI rejects other branches and mismatched registry metadata", async (t) => {
+  const fixture = await releaseFixture(t);
+  assert.equal(fixture.release("check", "0.1.0").status, 0);
   for (const branch of [
     "main",
     "staging",
     "dev",
-    "release/1",
-    "release/1.3",
-    "release/01.2",
-    "",
-    "refs/tags/v1.2.3",
-  ])
-    assert.throws(() => validateBranch("1.2.3", branch));
-});
-
-void test("metadata must agree across both registries and the lockfile", () => {
-  assert.equal(validateMetadata(...metadata()), "0.1.0");
-  const [pkg, lock, jsr] = metadata();
-  assert.throws(() => validateMetadata({ ...pkg, private: true }, lock, jsr));
-  assert.throws(() =>
-    validateMetadata(pkg, { ...lock, version: "0.1.1" }, jsr),
-  );
-  assert.throws(() => validateMetadata(pkg, lock, { ...jsr, name: "jev-bot" }));
-});
-
-void test("prepare updates all versions without mutating source objects or dependencies", () => {
-  const before = metadata();
-  const after = nextMetadata(...before, "0.1.1-rc.1", "release/0.1");
-  assert.equal(validateMetadata(...after), "0.1.1-rc.1");
-  assert.equal(validateMetadata(...before), "0.1.0");
-  assert.equal(after[1].packages["node_modules/example"].version, "4.0.0");
-  assert.throws(() => nextMetadata(...before, "0.1.0", "release/0.1"));
-  assert.throws(() => nextMetadata(...before, "0.0.9", "release/0.0"));
+    "release/0",
+    "release/0.2",
+    "release/00.1",
+  ]) {
+    fixture.git("switch", "-c", branch);
+    assert.notEqual(fixture.release("check").status, 0, branch);
+  }
+  fixture.git("checkout", "--detach");
+  assert.notEqual(fixture.release("check").status, 0);
+  fixture.git("switch", "release/0.1");
+  for (const [fileIndex, change] of [
+    [0, { private: true }],
+    [1, { version: "0.1.1" }],
+    [2, { name: "jev-bot" }],
+  ] as const) {
+    const values = metadata();
+    values[fileIndex] = { ...values[fileIndex]!, ...change };
+    await fixture.writeMetadata(values);
+    assert.notEqual(fixture.release("check").status, 0);
+    assert.deepEqual(await fixture.readMetadata(), values);
+  }
 });
 
 void test("maintenance and rc releases cannot move a newer npm channel backwards", () => {
@@ -326,66 +399,21 @@ void test("registry absence requires 404, while outages and bad replies stop pub
   );
 });
 
-void test("release CLI checks a real branch and prepares only reviewable metadata changes", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "jev-bot-release-cli-"));
-  const env = { ...process.env };
-  for (const name of Object.keys(env))
-    if (name.startsWith("GITHUB_") || name.startsWith("GIT_")) delete env[name];
-  const git = (...args: string[]) =>
-    execFileSync("git", args, { cwd: directory, env, stdio: "ignore" });
-  const release = (...args: string[]) =>
-    spawnSync(
-      process.execPath,
-      [join(directory, "scripts/release.mjs"), ...args],
-      { cwd: directory, env, encoding: "utf8" },
-    );
-  try {
-    await mkdir(join(directory, "scripts"));
-    for (const name of ["release.mjs", "release-lib.mjs"])
-      await cp(
-        new URL(`../scripts/${name}`, import.meta.url),
-        join(directory, "scripts", name),
-      );
-    const names = ["package.json", "package-lock.json", "jsr.json"];
-    const values = metadata();
-    for (const [index, name] of names.entries())
-      await writeFile(join(directory, name), JSON.stringify(values[index]));
-    git("init", "-b", "release/0.1");
-    git("add", ".");
-    git(
-      "-c",
-      "user.name=Release test",
-      "-c",
-      "user.email=release@example.test",
-      "commit",
-      "-m",
-      "fixture",
-    );
-    assert.equal(release("check", "0.1.0").status, 0);
-    assert.notEqual(release("check", "0.1.1").status, 0);
-    assert.notEqual(release("publish", "0.1.0").status, 0);
-    git("switch", "-c", "main");
-    assert.match(release("check").stderr, /must use branch release\/0\.1/);
-    git("switch", "release/0.1");
-    const prepared = release("prepare", "0.1.1-rc.1");
-    assert.equal(prepared.status, 0, prepared.stderr);
-    for (const name of names)
-      assert.equal(
-        (
-          JSON.parse(await readFile(join(directory, name), "utf8")) as {
-            version: string;
-          }
-        ).version,
-        "0.1.1-rc.1",
-      );
-    assert.match(release("prepare", "0.1.1").stderr, /Commit or set aside/);
-    const commits = execFileSync("git", ["rev-list", "--count", "HEAD"], {
-      cwd: directory,
-      env,
-      encoding: "utf8",
-    }).trim();
-    assert.equal(commits, "1");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
+void test("release CLI prepares reviewable metadata without publishing or committing", async (t) => {
+  const fixture = await releaseFixture(t);
+  assert.equal(fixture.release("check", "0.1.0").status, 0);
+  assert.notEqual(fixture.release("check", "0.1.1").status, 0);
+  assert.notEqual(fixture.release("publish", "0.1.0").status, 0);
+  assert.deepEqual(await fixture.readMetadata(), metadata("0.1.0"));
+  const prepared = fixture.release("prepare", "0.1.1-rc.1");
+  assert.equal(prepared.status, 0, prepared.stderr);
+  assert.deepEqual(await fixture.readMetadata(), metadata("0.1.1-rc.1"));
+  assert.notEqual(fixture.release("prepare", "0.1.1").status, 0);
+  assert.deepEqual(await fixture.readMetadata(), metadata("0.1.1-rc.1"));
+  assert.equal(fixture.git("rev-list", "--count", "HEAD"), "1");
+  assert.deepEqual(fixture.git("diff", "--name-only").split("\n"), [
+    "jsr.json",
+    "package-lock.json",
+    "package.json",
+  ]);
 });

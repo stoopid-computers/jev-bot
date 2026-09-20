@@ -1,17 +1,40 @@
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
+import { parseKeyChord, preservesEditTarget } from "./keys.js";
 import type {
   CallToolResult,
   ContentBlock,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { DesktopEngine } from "./engine.js";
-import type { Element, Observation, RunRequest, Target } from "./types.js";
+import type {
+  Element,
+  Observation,
+  RunRequest,
+  Target,
+  VisualAction,
+  VisualTarget,
+} from "./types.js";
 
 export const DOCUMENTATION = `Computer use through CUA and Jev. JavaScript bindings persist between js calls.
 Start with await cua.getState() or let app = await cua.getApp("App name or bundle ID").
 getApp selects one running app with one visible window and emits its accessibility state.
 For multiple windows use await cua.getWindow(pid, windowId) from getState's inventory.
+For screenshot-based browser or native input select an observed window with
+await cua.getWindow(pid, windowId, {mode:"visual",activate:true}). This explicitly brings it to the foreground.
+Visual handles emit an initial screenshot and support getScreenshot(), move([x,y]), click([x,y]),
+typeText("exact text", {at:[x,y]}), pressKey("Cmd+K"), and scroll([x,y], "down", 3).
+Coordinates are pixels in the original returned PNG, never screen points or a resized preview.
+Capture a fresh screenshot after each input before selecting the next point. Visual input is never retried automatically.
+For system controls outside an app use await cua.getDesktop(); it supports getScreenshot(), click([x,y]), and move([x,y]) on the primary display.
+Window input uses background delivery and an independent agent cursor. Window move needs the patched local driver.
+Desktop move positions the real pointer; do not use it when the user requires an independent cursor.
+Inspect a fresh screenshot to check hover effects. getScreenshot({settleMs:100}) waits only the unelapsed part of 100ms after a hover; use 0 to opt out.
+The hardware pointer stays in place, but browser-native tooltips can still appear beside it. Native-only input cannot isolate that browser tooltip state.
+cua.configureCursor({themeId?:string,glideDurationMs?:number,dwellAfterClickMs?:number,idleHideMs?:number}) configures this connection without input.
+Themes must already be installed. Use 120ms glide, 0ms dwell and 1500ms idle visibility for brief, direct motion.
+The host must inspect screenshots for visual targeting and confirmation. Jev act remains limited to native accessibility controls.
 
 cua.getState({emit?:boolean}); cua.listApps({emit?:boolean});
 app.getAXState({emit?:boolean,disableDiffing?:boolean,query?:string});
@@ -28,8 +51,10 @@ Batch deterministic actions with a final state read. Await every API call. Do no
 Jev act calls observe, select one allowed action, execute and read back. maxSteps is 1..8, default 4.
 Status verified means the caller's exact positive predicate matched one returned element. Partial trees cannot prove absence or global uniqueness.
 Unknown delivery is never retried. Handoff means the host must interpret fresh evidence or provide missing inputs.
-Jev sees accessibility text, never screenshots. The host handles visual interpretation. This first version supports native AX clicks,
-field text and a small navigation-key set. Browser tabs, app launching, coordinate clicks, dragging, scrolling and clipboard paste are not implemented.
+Jev sees accessibility text, never screenshots. The host handles visual interpretation. Native handles support AX clicks,
+field text and key chords. Visual handles support pointer clicks, field typing, key chords and scrolling with the driver's visible cursor.
+pressKey accepts a letter, digit, F1-F12, navigation key or chord such as Cmd+K. Jev act's keys remain limited to navigation/editing keys.
+Browser tab APIs, app launching, dragging and clipboard paste are not implemented. Do not enter URLs when a task asks for pointer-only navigation.
 No arbitrary shell or filesystem operations belong in this tool. Only perform actions authorized by the user's task.`;
 
 const optionsSchema = z
@@ -40,6 +65,32 @@ const optionsSchema = z
   })
   .strict()
   .default({});
+const selectionOptionsSchema = z
+  .object({
+    mode: z.enum(["accessibility", "visual"]).optional(),
+    activate: z.boolean().optional(),
+  })
+  .strict()
+  .default({});
+const visualCaptureOptionsSchema = z
+  .object({
+    emit: z.boolean().optional(),
+    settleMs: z.number().int().min(0).max(1000).optional(),
+  })
+  .strict()
+  .default({});
+const pointSchema = z.tuple([
+  z.number().finite().nonnegative(),
+  z.number().finite().nonnegative(),
+]);
+const cursorOptionsSchema = z
+  .object({
+    themeId: z.string().trim().min(1).max(200).optional(),
+    glideDurationMs: z.number().min(0).max(5000).optional(),
+    dwellAfterClickMs: z.number().min(0).max(5000).optional(),
+    idleHideMs: z.number().min(0).max(60000).optional(),
+  })
+  .strict();
 const runOptionsSchema = z
   .object({
     text: z.string().max(8000).optional(),
@@ -67,7 +118,17 @@ type AppHandle = {
 type EnginePort = Pick<
   DesktopEngine,
   "listApps" | "listWindows" | "observe" | "screenshot" | "execute" | "run"
->;
+> &
+  Partial<
+    Pick<
+      DesktopEngine,
+      "activate" | "visualScreenshot" | "visualExecute" | "configureCursor"
+    >
+  >;
+type VisualHandle = {
+  target: VisualTarget;
+  frame?: { width: number; height: number };
+};
 type Active = {
   outputs: ContentBlock[];
   controller: AbortController;
@@ -99,9 +160,11 @@ function line(element: Element): string {
 }
 
 export class ComputerRepl {
+  private hoverCompletedAt?: number;
   private worker?: Worker;
   private active?: Active;
   private handles = new Map<string, AppHandle>();
+  private visualHandles = new Map<string, VisualHandle>();
   private snapshots = new Map<string, string>();
   private documented = false;
   private sequence = 0;
@@ -160,6 +223,7 @@ export class ComputerRepl {
         active.controller.abort();
         this.worker = undefined;
         this.handles.clear();
+        this.visualHandles.clear();
         this.snapshots.clear();
         this.documented = false;
         void worker.terminate();
@@ -242,6 +306,7 @@ export class ComputerRepl {
       if (this.worker !== worker) return;
       this.worker = undefined;
       this.handles.clear();
+      this.visualHandles.clear();
       this.snapshots.clear();
       this.documented = false;
     };
@@ -275,6 +340,7 @@ export class ComputerRepl {
     await this.worker?.terminate();
     this.worker = undefined;
     this.handles.clear();
+    this.visualHandles.clear();
     this.snapshots.clear();
     this.documented = false;
   }
@@ -300,6 +366,133 @@ export class ComputerRepl {
   }
   private invalidate(handle: AppHandle) {
     this.snapshots.delete(this.key(handle.target));
+    this.invalidateFrames();
+  }
+  private invalidateFrames() {
+    for (const handle of this.visualHandles.values()) handle.frame = undefined;
+  }
+  private async visualRead(
+    handle: VisualHandle,
+    active: Active,
+    emit = true,
+    settleMs = 100,
+  ) {
+    if (!this.engine.visualScreenshot)
+      throw new Error("Visual capture is unavailable in this driver.");
+    this.invalidateFrames();
+    handle.frame = undefined;
+    this.snapshots.clear();
+    // PID posting acknowledges dispatch before the browser necessarily paints.
+    // Wait only for the unelapsed part of this brief post-hover interval.
+    const remaining =
+      this.hoverCompletedAt === undefined
+        ? 0
+        : settleMs - (performance.now() - this.hoverCompletedAt);
+    if (remaining > 0)
+      await delay(remaining, undefined, { signal: active.controller.signal });
+    const screenshot = await this.engine.visualScreenshot(handle.target);
+    const bytes = Buffer.from(screenshot.data, "base64");
+    if (
+      bytes.length < 24 ||
+      !bytes
+        .subarray(0, 8)
+        .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    )
+      throw new Error("Visual capture did not return a PNG frame.");
+    const width = bytes.readUInt32BE(16);
+    const height = bytes.readUInt32BE(20);
+    if (!width || !height || width > 32768 || height > 32768)
+      throw new Error("Visual capture returned invalid dimensions.");
+    if (emit) {
+      this.emitImage(active, screenshot);
+      this.emit(
+        active,
+        `Screenshot ${width} x ${height}. Use coordinates in these original PNG pixels. Read a new screenshot after input.`,
+      );
+    }
+    handle.frame = { width, height };
+    return new Uint8Array(bytes);
+  }
+  private async visualInvoke(
+    method: string,
+    args: unknown[],
+    handle: VisualHandle,
+    active: Active,
+  ) {
+    if (method === "getScreenshot") {
+      const options = visualCaptureOptionsSchema.parse(args[1]);
+      return this.visualRead(
+        handle,
+        active,
+        options.emit !== false,
+        options.settleMs,
+      );
+    }
+    if (!["click", "move", "typeText", "scroll", "pressKey"].includes(method))
+      throw new Error(
+        "Visual handles support getScreenshot, move([x,y]), click([x,y]), typeText(text,{at:[x,y]}), pressKey(key), and scroll([x,y],direction,amount). Use an accessibility handle for native indices or Jev act.",
+      );
+    if ("displayId" in handle.target && method !== "click" && method !== "move")
+      throw new Error(
+        "Desktop visual handles support screenshot-based clicks and pointer moves only. Select an exact window for text or scrolling.",
+      );
+    if (!handle.frame)
+      throw new Error(
+        "Read a fresh getScreenshot() before selecting a visual target.",
+      );
+    if (method === "pressKey") {
+      if ("displayId" in handle.target)
+        throw new Error("Select an exact window for keyboard input.");
+      const { chord } = parseKeyChord(args[1]);
+      if (!this.engine.visualExecute)
+        throw new Error("Visual input is unavailable in this driver.");
+      this.invalidateFrames();
+      this.snapshots.clear();
+      const receipt = await this.engine.visualExecute({
+        kind: "press_key",
+        target: handle.target,
+        key: chord,
+      });
+      this.emit(active, receipt);
+      return receipt;
+    }
+    const typeOptions =
+      method === "typeText"
+        ? z.object({ at: pointSchema }).strict().parse(args[2])
+        : undefined;
+    const [x, y] = pointSchema.parse(typeOptions?.at ?? args[1]);
+    if (x >= handle.frame.width || y >= handle.frame.height)
+      throw new Error(
+        "Point is outside the original screenshot. Use its PNG pixel dimensions.",
+      );
+    const action: VisualAction =
+      method === "click" || method === "move"
+        ? { kind: method, target: handle.target, x, y }
+        : method === "typeText"
+          ? {
+              kind: "type_text",
+              target: handle.target,
+              x,
+              y,
+              text: z.string().min(1).max(8000).parse(args[1]),
+            }
+          : {
+              kind: "scroll",
+              target: handle.target,
+              x,
+              y,
+              direction: z.enum(["up", "down", "left", "right"]).parse(args[2]),
+              amount: z.number().int().min(1).max(50).default(3).parse(args[3]),
+            };
+    if (!this.engine.visualExecute)
+      throw new Error("Visual input is unavailable in this driver.");
+    this.invalidateFrames();
+    this.snapshots.clear();
+    const receipt = await this.engine.visualExecute(action);
+    if (method === "move" && receipt.attempted !== false)
+      this.hoverCompletedAt = performance.now();
+    this.emit(active, receipt);
+    return receipt;
   }
   private async read(
     handle: AppHandle,
@@ -381,6 +574,14 @@ export class ComputerRepl {
       });
       return;
     }
+    if (method === "configureCursor") {
+      const options = cursorOptionsSchema.parse(args[0]);
+      if (!this.engine.configureCursor)
+        throw new Error("Cursor configuration is unavailable in this driver.");
+      const result = await this.engine.configureCursor(options);
+      this.emit(active, result);
+      return result;
+    }
     if (method === "getState" || method === "listApps") {
       const options = optionsSchema.parse(args[0]);
       const apps = await this.engine.listApps();
@@ -391,7 +592,17 @@ export class ComputerRepl {
       if (options.emit !== false) this.emit(active, state);
       return state;
     }
+    if (method === "getDesktop") {
+      const id = randomUUID();
+      const handle: VisualHandle = { target: { displayId: "primary" } };
+      await this.visualRead(handle, active);
+      this.visualHandles.set(id, handle);
+      return id;
+    }
     if (method === "getApp" || method === "getWindow") {
+      const selection = selectionOptionsSchema.parse(
+        args[method === "getApp" ? 1 : 2],
+      );
       let target: Target;
       if (method === "getApp") {
         const name = z.string().min(1).parse(args[0]);
@@ -404,12 +615,15 @@ export class ComputerRepl {
           throw new Error(
             "Select one running app by its exact name or bundle ID from cua.listApps(). App launching is not implemented.",
           );
-        const windows = records(
+        const available = records(
           (await this.engine.listWindows()).windows,
-        ).filter(
-          (window) =>
-            window.pid === apps[0]?.pid && window.is_on_screen === true,
-        );
+        ).filter((window) => window.pid === apps[0]?.pid);
+        const windows = selection.activate
+          ? available.filter(
+              (window) =>
+                typeof window.title === "string" && window.title.trim(),
+            )
+          : available.filter((window) => window.is_on_screen === true);
         if (windows.length !== 1)
           throw new Error(
             "Select an exact window with cua.getWindow(pid, windowId) from cua.getState().",
@@ -424,11 +638,29 @@ export class ComputerRepl {
           windowId: z.number().int().positive().parse(args[1]),
         };
       const id = randomUUID();
+      if (selection.activate) {
+        if (!this.engine.activate)
+          throw new Error(
+            "Exact window activation is unavailable in this driver.",
+          );
+        this.invalidateFrames();
+        this.snapshots.clear();
+        await this.engine.activate(target);
+      }
+      if (selection.mode === "visual") {
+        const handle: VisualHandle = { target };
+        await this.visualRead(handle, active);
+        this.visualHandles.set(id, handle);
+        return id;
+      }
       const handle: AppHandle = { target };
       await this.read(handle, { disableDiffing: true }, active);
       this.handles.set(id, handle);
       return id;
     }
+    const visualHandle = this.visualHandles.get(String(args[0]));
+    if (visualHandle)
+      return this.visualInvoke(method, args, visualHandle, active);
     const handle = this.handles.get(String(args[0]));
     if (!handle) throw new Error("App handle expired. Select the app again.");
     if (method === "getAXState")
@@ -543,30 +775,13 @@ export class ComputerRepl {
       return receipt;
     }
     if (method === "pressKey") {
-      const key = z
-        .enum([
-          "return",
-          "tab",
-          "escape",
-          "space",
-          "backspace",
-          "delete",
-          "up",
-          "down",
-          "left",
-          "right",
-          "home",
-          "end",
-          "pageup",
-          "pagedown",
-        ])
-        .parse(String(args[1]).toLowerCase());
+      const { key, modifiers, chord } = parseKeyChord(args[1]);
       this.invalidate(handle);
-      handle.editTarget = undefined;
+      if (!preservesEditTarget(key, modifiers)) handle.editTarget = undefined;
       const receipt = await this.engine.execute({
         kind: "press_key",
         target: handle.target,
-        key,
+        key: chord,
       });
       this.emit(active, receipt);
       return receipt;

@@ -11,7 +11,10 @@ import type {
   RunRequest,
   RunResult,
   Target,
+  VisualAction,
+  VisualTarget,
 } from "./types.js";
+import { parseKeyChord } from "./keys.js";
 
 const KEYS = new Set([
   "return",
@@ -376,6 +379,16 @@ export class DesktopEngine {
     return this.exclusive(async () => owned(await this.driver.listWindows()));
   }
 
+  async configureCursor(
+    options: Parameters<NonNullable<Driver["configureCursor"]>>[0],
+  ): Promise<JsonObject> {
+    return this.exclusive(async () => {
+      if (!this.driver.configureCursor)
+        throw new Error("This driver cannot configure its cursor.");
+      return owned(await this.driver.configureCursor(owned(options)));
+    });
+  }
+
   async listApps(): Promise<JsonObject> {
     return this.exclusive(async () => {
       if (!this.driver.listApps)
@@ -395,12 +408,47 @@ export class DesktopEngine {
     });
   }
 
+  async activate(target: Target): Promise<JsonObject> {
+    return this.exclusive(async () => {
+      validateTarget(target);
+      if (!this.driver.activate)
+        throw new Error("This driver cannot activate an exact window.");
+      return owned(await this.driver.activate(owned(target)));
+    });
+  }
+
+  async visualScreenshot(
+    target: VisualTarget,
+  ): Promise<{ data: string; mimeType: string }> {
+    return this.exclusive(async () => {
+      if (!this.driver.visualScreenshot)
+        throw new Error("This driver cannot capture visual targets.");
+      return owned(await this.driver.visualScreenshot(owned(target)));
+    });
+  }
+
+  async visualExecute(action: VisualAction): Promise<JsonObject> {
+    return this.exclusive(async () => {
+      if (!this.driver.visualExecute)
+        throw new Error("This driver cannot send screenshot-based input.");
+      try {
+        return owned(await this.driver.visualExecute(owned(action)));
+      } catch {
+        return owned({
+          executed: false,
+          execution: "unknown",
+          reason:
+            "Visual input was interrupted. Inspect a fresh screenshot before continuing. Do not retry automatically.",
+        });
+      }
+    });
+  }
+
   async execute(action: NativeAction): Promise<JsonObject> {
     return this.exclusive(async () => {
       validateTarget(action.target);
       if (action.kind === "press_key") {
-        if (!KEYS.has(action.key))
-          throw new Error("This native key is unsupported.");
+        parseKeyChord(action.key);
       } else if (
         action.kind === "click" ||
         action.kind === "type_text" ||

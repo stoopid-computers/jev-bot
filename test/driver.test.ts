@@ -4,11 +4,9 @@ import test from "node:test";
 import {
   createDriver,
   createDriverSchemaValidator,
-  normalizeObservation,
-  normalizeReceipt,
   type DriverClient,
 } from "../src/driver.js";
-import type { JsonObject } from "../src/types.js";
+import type { JsonObject, VisualAction, VisualTarget } from "../src/types.js";
 
 const target = { pid: 42, windowId: 12 };
 const session = "test-session";
@@ -285,90 +283,109 @@ void test("never retries actions or exposes raw error content", async () => {
   assert.equal(fixture.calls.length, 1);
 });
 
-void test("wrong-window, unsafe IDs, duplicate tokens and malformed snapshot fields fail closed", () => {
-  assert.throws(() =>
-    normalizeObservation({ ...state(), window_id: 999 }, target),
-  );
-  assert.throws(() =>
-    normalizeObservation(state(), {
+async function observePayload(
+  payload: JsonObject,
+  requested = target,
+  query?: string,
+) {
+  const fixture = fake(tools(), { structuredContent: payload });
+  const driver = await createDriver(fixture.client, session);
+  try {
+    return await driver.observe(requested, query);
+  } finally {
+    await driver.close();
+  }
+}
+
+async function executePayload(result: unknown) {
+  const fixture = fake(tools(), result);
+  const driver = await createDriver(fixture.client, session);
+  try {
+    return await driver.execute({
+      kind: "click",
+      target,
+      elementToken: "s00000001:0",
+    });
+  } finally {
+    await driver.close();
+  }
+}
+
+void test("wrong-window, unsafe IDs, duplicate tokens and malformed snapshots fail at the driver boundary", async () => {
+  for (const payload of [
+    { ...state(), window_id: 999 },
+    { ...state(), snapshot_id: undefined },
+    { ...state(), degraded: "false" },
+    {
+      ...state(),
+      elements: [
+        { element_index: 0, element_token: "duplicate", role: "AXButton" },
+        { element_index: 1, element_token: "duplicate", role: "AXButton" },
+      ],
+    },
+  ])
+    await assert.rejects(observePayload(payload));
+  await assert.rejects(
+    observePayload(state(), {
       ...target,
       windowId: Number.MAX_SAFE_INTEGER + 1,
     }),
   );
-  assert.throws(() =>
-    normalizeObservation({ ...state(), snapshot_id: undefined }, target),
-  );
-  assert.throws(() =>
-    normalizeObservation(
+});
+
+void test("secure fields and raw tree content never reach driver observations", async () => {
+  const observed = await observePayload({
+    ...state(),
+    tree_markdown: "password secret",
+    elements: [
       {
-        ...state(),
-        elements: [
-          { element_index: 0, element_token: "duplicate", role: "AXButton" },
-          { element_index: 1, element_token: "duplicate", role: "AXButton" },
-        ],
+        element_index: 0,
+        role: "AXSecureTextField",
+        label: "Account",
+        value: "secret-password",
       },
-      target,
-    ),
+      {
+        element_index: 1,
+        role: "AXTextField",
+        label: "Password",
+        value: "another-secret",
+      },
+      {
+        element_index: 2,
+        role: "AXButton",
+        label: "Continue",
+        actions: ["AXPress"],
+      },
+    ],
+  });
+  assert.deepEqual(
+    observed.elements.map((element) => element.label),
+    ["Continue"],
   );
-  assert.throws(() =>
-    normalizeObservation({ ...state(), degraded: "false" }, target),
-  );
+  assert.equal(observed.complete, false);
+  assert.doesNotMatch(JSON.stringify(observed), /secret|password/i);
 });
 
-void test("secure elements and raw tree content never reach normalized observations", () => {
-  const result = normalizeObservation(
-    {
-      ...state(),
-      tree_markdown: "password secret",
-      elements: [
-        {
-          element_index: 0,
-          role: "AXSecureTextField",
-          label: "Account",
-          value: "secret-password",
-        },
-        {
-          element_index: 1,
-          role: "AXTextField",
-          label: "Password",
-          value: "another-secret",
-        },
-        {
-          element_index: 2,
-          role: "AXButton",
-          label: "Continue",
-          actions: ["AXPress"],
-        },
-      ],
-    },
-    target,
-  );
-  assert.equal(result.elements.length, 1);
-  assert.equal(result.complete, false);
-  assert.doesNotMatch(JSON.stringify(result), /secret|password/i);
-});
-
-void test("partial, missing-completeness and degraded observations cannot claim complete evidence", () => {
+void test("partial, filtered and degraded driver observations cannot claim complete evidence", async () => {
   for (const flags of [
     { truncated: true },
     { degraded: true },
     { elements_complete: undefined },
     { filtered_element_count: 1 },
     { filtered_element_count: 0 },
-  ]) {
+  ])
     assert.equal(
-      normalizeObservation({ ...state(), ...flags }, target).complete,
+      (await observePayload({ ...state(), ...flags })).complete,
       false,
     );
-  }
-  assert.equal(normalizeObservation(state(), target, true).complete, false);
-  assert.equal(normalizeObservation(state(), target).complete, true);
-  assert.throws(() =>
-    normalizeObservation({ ...state(), filtered_element_count: -1 }, target),
+  assert.equal((await observePayload(state(), target, "7")).complete, false);
+  assert.equal((await observePayload(state())).complete, true);
+  await assert.rejects(
+    observePayload({ ...state(), filtered_element_count: -1 }),
   );
 });
 
-void test("receipts require confirmed background evidence and preserve stale refusal without raw text", () => {
+void test("driver execution requires background evidence and redacts stale refusals", async () => {
   for (const payload of [
     { effect: "unverifiable", delivery: { mode: "background" } },
     { effect: "confirmed", delivery: { mode: "background" } },
@@ -380,18 +397,18 @@ void test("receipts require confirmed background evidence and preserve stale ref
     { executed: true },
   ])
     assert.equal(
-      normalizeReceipt({ structuredContent: payload }).executed,
+      (await executePayload({ structuredContent: payload })).executed,
       false,
     );
-  assert.deepEqual(
-    normalizeReceipt({
-      isError: true,
-      structuredContent: {
-        refusal: { code: "stale_element_token", message: "private content" },
-      },
-    }),
-    { executed: false, stale: true, effect: "refused" },
-  );
+  const stale = await executePayload({
+    isError: true,
+    structuredContent: {
+      refusal: { code: "stale_element_token", message: "private content" },
+    },
+  });
+  assert.equal(stale.executed, false);
+  assert.equal(stale.stale, true);
+  assert.doesNotMatch(JSON.stringify(stale), /private content/);
 });
 
 void test("tool discovery handles pagination and rejects repeated cursors", async () => {
@@ -655,4 +672,590 @@ void test("CUA integer formats validate without ignored-format warnings and reta
   } finally {
     console.warn = original;
   }
+});
+
+const pixel = { type: "number" };
+const pngPixel =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=";
+
+function visualTools() {
+  return [
+    ...tools().map((entry) => {
+      if (entry.name === "click")
+        return tool("click", {
+          ...common,
+          target: { type: "object" },
+          x: pixel,
+          y: pixel,
+        });
+      if (entry.name === "type_text")
+        return tool("type_text", {
+          ...common,
+          pid: int,
+          window_id: int,
+          x: pixel,
+          y: pixel,
+          text: str,
+        });
+      return entry;
+    }),
+    tool("scroll", {
+      ...common,
+      target: { type: "object" },
+      x: pixel,
+      y: pixel,
+      direction: str,
+      amount: int,
+      by: str,
+    }),
+    tool("bring_to_front", { pid: int, window_id: int }, ["pid"]),
+    tool("move_cursor", {
+      session: str,
+      target: { type: "object" },
+      x: pixel,
+      y: pixel,
+    }),
+    tool("get_desktop_state", { session: str }),
+  ];
+}
+
+void test("window activation accepts only verified focus and exact window order", async () => {
+  const activated = {
+    pid: 42,
+    window_id: 12,
+    status: "activated",
+    activated: true,
+    exact_window_effect: {
+      verified: true,
+      focused: true,
+      frontmost_ordinary: true,
+    },
+  };
+  const fixture = fake(visualTools(), { structuredContent: activated });
+  const driver = await createDriver(fixture.client, session);
+  assert.deepEqual(await driver.activate!(target), { activated: true, target });
+  assert.deepEqual(fixture.calls, [
+    { name: "bring_to_front", arguments: { pid: 42, window_id: 12 } },
+  ]);
+  for (const flags of [
+    { status: "partial" },
+    { window_id: 99 },
+    { activated: false },
+    {
+      exact_window_effect: {
+        verified: true,
+        focused: false,
+        frontmost_ordinary: true,
+      },
+    },
+    {
+      exact_window_effect: {
+        verified: false,
+        focused: true,
+        frontmost_ordinary: true,
+      },
+    },
+  ]) {
+    const failed = fake(visualTools(), {
+      structuredContent: { ...activated, ...flags },
+    });
+    const failingDriver = await createDriver(failed.client, session);
+    await assert.rejects(
+      failingDriver.activate!(target),
+      /exact window is foreground/,
+    );
+    assert.equal(failed.calls.length, 1);
+  }
+});
+
+void test("visual inputs preserve the exact window and explicit background delivery", async () => {
+  const fixture = fake(visualTools(), {
+    structuredContent: { effect: "confirmed", verified: true },
+  });
+  const driver = await createDriver(fixture.client, session);
+  for (const action of [
+    { kind: "click", target, x: 10, y: 20 },
+    { kind: "type_text", target, x: 30, y: 40, text: "hello" },
+    { kind: "scroll", target, x: 50, y: 60, direction: "down", amount: 2 },
+  ] satisfies VisualAction[]) {
+    assert.deepEqual(await driver.visualExecute!(action), {
+      attempted: true,
+      executed: false,
+      execution: "unknown",
+      effect: "unverifiable",
+    });
+  }
+  assert.deepEqual(fixture.calls, [
+    {
+      name: "click",
+      arguments: {
+        target: { kind: "window", pid: 42, window_id: 12 },
+        session,
+        delivery_mode: "background",
+        x: 10,
+        y: 20,
+      },
+    },
+    {
+      name: "type_text",
+      arguments: {
+        pid: 42,
+        window_id: 12,
+        session,
+        delivery_mode: "background",
+        x: 30,
+        y: 40,
+        text: "hello",
+      },
+    },
+    {
+      name: "scroll",
+      arguments: {
+        target: { kind: "window", pid: 42, window_id: 12 },
+        session,
+        delivery_mode: "background",
+        x: 50,
+        y: 60,
+        direction: "down",
+        amount: 2,
+        by: "line",
+      },
+    },
+  ]);
+});
+
+void test("desktop clicks use only the explicit primary-display target", async () => {
+  const fixture = fake(visualTools(), {
+    structuredContent: { effect: "unverifiable" },
+  });
+  const driver = await createDriver(fixture.client, session);
+  await driver.visualExecute!({
+    kind: "click",
+    target: { displayId: "primary" },
+    x: 0,
+    y: 10,
+  });
+  assert.deepEqual(fixture.calls[0], {
+    name: "click",
+    arguments: {
+      target: { kind: "desktop", display_id: "primary" },
+      session,
+      x: 0,
+      y: 10,
+    },
+  });
+  for (const action of [
+    {
+      kind: "type_text",
+      target: { displayId: "primary" },
+      x: 0,
+      y: 10,
+      text: "no",
+    },
+    {
+      kind: "scroll",
+      target: { displayId: "primary" },
+      x: 0,
+      y: 10,
+      direction: "down",
+    },
+  ] satisfies VisualAction[]) {
+    await assert.rejects(
+      driver.visualExecute!(action),
+      /clicks and moves only/,
+    );
+  }
+  assert.equal(fixture.calls.length, 1);
+});
+
+void test("visual shortcuts send separate keys and modifiers only to the exact background window", async () => {
+  const inventory = visualTools().map((entry) =>
+    entry.name === "press_key"
+      ? tool("press_key", {
+          ...common,
+          pid: int,
+          window_id: int,
+          key: str,
+          modifiers: { type: "array", items: str },
+        })
+      : entry,
+  );
+  const fixture = fake(inventory, {
+    structuredContent: { effect: "unverifiable" },
+  });
+  const driver = await createDriver(fixture.client, session);
+  await driver.visualExecute!({
+    kind: "press_key",
+    target,
+    key: "Meta+Shift+K",
+  });
+  assert.deepEqual(fixture.calls, [
+    {
+      name: "press_key",
+      arguments: {
+        pid: 42,
+        window_id: 12,
+        session,
+        delivery_mode: "background",
+        key: "k",
+        modifiers: ["cmd", "shift"],
+      },
+    },
+  ]);
+  await assert.rejects(
+    driver.visualExecute!({ kind: "press_key", target, key: "cmd+k+q" }),
+    /key/i,
+  );
+  assert.equal(fixture.calls.length, 1);
+});
+
+void test("visual refusals expose a safe reason and do not describe input as attempted", async () => {
+  const fixture = fake(visualTools(), {
+    isError: true,
+    structuredContent: {
+      code: "off_space_or_ax_unresolved",
+      effect: "refused",
+      reason: "private native content",
+    },
+  });
+  const driver = await createDriver(fixture.client, session);
+  const receipt = await driver.visualExecute!({
+    kind: "move",
+    target,
+    x: 10,
+    y: 20,
+  });
+  assert.equal(receipt.attempted, false);
+  assert.equal(receipt.effect, "refused");
+  assert.equal(receipt.code, "off_space_or_ax_unresolved");
+  assert.match(String(receipt.recovery), /current desktop/i);
+  assert.doesNotMatch(JSON.stringify(receipt), /private native content/);
+  assert.equal(fixture.calls.length, 1);
+});
+
+void test("visual input rejects invalid coordinates, text, wheel bounds and ambiguous targets before dispatch", async () => {
+  const fixture = fake(visualTools());
+  const driver = await createDriver(fixture.client, session);
+  for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await assert.rejects(
+      driver.visualExecute!({ kind: "click", target, x: value, y: 1 }),
+    );
+    await assert.rejects(
+      driver.visualExecute!({ kind: "click", target, x: 1, y: value }),
+    );
+  }
+  for (const amount of [0, 51, 1.5, Number.NaN]) {
+    await assert.rejects(
+      driver.visualExecute!({
+        kind: "scroll",
+        target,
+        x: 0,
+        y: 0,
+        direction: "down",
+        amount,
+      }),
+    );
+  }
+  await assert.rejects(
+    driver.visualExecute!({
+      kind: "type_text",
+      target,
+      x: 0,
+      y: 0,
+      text: "a".repeat(8_001),
+    }),
+  );
+  await assert.rejects(
+    driver.visualExecute!({
+      kind: "click",
+      target: { ...target, displayId: "primary" },
+      x: 0,
+      y: 0,
+    }),
+  );
+  assert.equal(fixture.calls.length, 0);
+});
+
+void test("pointer moves preserve original pixels and keep window and desktop targets separate", async () => {
+  const fixture = fake(visualTools(), {
+    structuredContent: { scope: "desktop", effect: "unverifiable" },
+  });
+  const driver = await createDriver(fixture.client, session);
+  assert.deepEqual(
+    await driver.visualExecute!({
+      kind: "move",
+      target: { displayId: "primary" },
+      x: 600,
+      y: 400,
+    }),
+    {
+      attempted: true,
+      executed: false,
+      execution: "unknown",
+      effect: "unverifiable",
+    },
+  );
+  assert.deepEqual(fixture.calls, [
+    {
+      name: "move_cursor",
+      arguments: {
+        target: { kind: "desktop", display_id: "primary" },
+        session,
+        x: 600,
+        y: 400,
+      },
+    },
+  ]);
+  await driver.visualExecute!({ kind: "move", target, x: 600, y: 400 });
+  assert.deepEqual(fixture.calls[1], {
+    name: "move_cursor",
+    arguments: {
+      target: { kind: "window", pid: 42, window_id: 12 },
+      session,
+      x: 600,
+      y: 400,
+    },
+  });
+});
+
+void test("visual input refuses unsupported background or coordinate schemas without fallback", async () => {
+  for (const replacement of [
+    tool("click", {
+      session: str,
+      target: { type: "object" },
+      x: pixel,
+      y: pixel,
+    }),
+    tool("click", { ...common, target: { type: "object" } }),
+    tool("click", {
+      ...common,
+      target: { type: "object" },
+      x: pixel,
+      y: pixel,
+      delivery_mode: { type: "string", enum: ["foreground"] },
+    }),
+  ]) {
+    const fixture = fake(
+      visualTools().map((entry) =>
+        entry.name === "click" ? replacement : entry,
+      ),
+    );
+    const driver = await createDriver(fixture.client, session);
+    await assert.rejects(
+      driver.visualExecute!({ kind: "click", target, x: 10, y: 20 }),
+    );
+    assert.equal(fixture.calls.length, 0);
+  }
+});
+
+void test("window pointer movement refuses a schema without exact canonical targets", async () => {
+  const fixture = fake(
+    visualTools().map((entry) =>
+      entry.name === "move_cursor"
+        ? tool("move_cursor", {
+            session: str,
+            x: pixel,
+            y: pixel,
+            pid: int,
+            window_id: int,
+          })
+        : entry,
+    ),
+  );
+  const driver = await createDriver(fixture.client, session);
+  await assert.rejects(
+    driver.visualExecute!({ kind: "move", target, x: 10, y: 20 }),
+    /safe input contract/,
+  );
+  assert.equal(fixture.calls.length, 0);
+});
+
+void test("cursor configuration stays on its owned session and sends no desktop input", async () => {
+  const fixture = fake([
+    ...visualTools(),
+    tool("set_agent_cursor_theme", {
+      session: str,
+      theme_id: str,
+      reduced_motion: str,
+    }),
+    tool("set_agent_cursor_motion", {
+      session: str,
+      arc_size: pixel,
+      spring: pixel,
+      glide_duration_ms: pixel,
+      dwell_after_click_ms: pixel,
+      idle_hide_ms: pixel,
+    }),
+  ]);
+  fixture.client.callTool = async (call) => {
+    fixture.calls.push(call);
+    return {
+      structuredContent:
+        call.name === "set_agent_cursor_theme"
+          ? {
+              session: call.arguments.session,
+              theme: { id: call.arguments.theme_id },
+            }
+          : { session: call.arguments.session, motion: call.arguments },
+    };
+  };
+  const driver = await createDriver(fixture.client, "Jev");
+  assert.deepEqual(
+    await driver.configureCursor!({
+      themeId: "compootor.small",
+      glideDurationMs: 120,
+      dwellAfterClickMs: 0,
+      idleHideMs: 20_000,
+    }),
+    {
+      configured: true,
+      session: "Jev",
+      themeId: "compootor.small",
+    },
+  );
+  assert.deepEqual(fixture.calls, [
+    {
+      name: "set_agent_cursor_theme",
+      arguments: {
+        session: "Jev",
+        theme_id: "compootor.small",
+        reduced_motion: "on",
+      },
+    },
+    {
+      name: "set_agent_cursor_motion",
+      arguments: {
+        session: "Jev",
+        arc_size: 0,
+        spring: 1,
+        glide_duration_ms: 120,
+        dwell_after_click_ms: 0,
+        idle_hide_ms: 20_000,
+      },
+    },
+  ]);
+  const before = fixture.calls.length;
+  for (const invalid of [
+    { glideDurationMs: -1 },
+    { glideDurationMs: 5_001 },
+    { dwellAfterClickMs: Number.NaN },
+    { idleHideMs: 60_001 },
+    { themeId: "" },
+    { session: "other" },
+  ]) {
+    await assert.rejects(driver.configureCursor!(invalid));
+  }
+  assert.equal(fixture.calls.length, before);
+});
+
+void test("cursor configuration validates all schemas before changing a theme", async () => {
+  const fixture = fake([
+    tool("set_agent_cursor_theme", {
+      session: str,
+      theme_id: str,
+      reduced_motion: str,
+    }),
+    tool("set_agent_cursor_motion", { session: str }),
+  ]);
+  const driver = await createDriver(fixture.client, session);
+  await assert.rejects(
+    driver.configureCursor!({
+      themeId: "compootor.small",
+      glideDurationMs: 120,
+    }),
+  );
+  assert.equal(fixture.calls.length, 0);
+});
+
+void test("visual action failures remain unknown and are never replayed", async () => {
+  const fixture = fake(visualTools(), {
+    isError: true,
+    structuredContent: { message: "private details" },
+  });
+  const driver = await createDriver(fixture.client, session);
+  assert.deepEqual(
+    await driver.visualExecute!({ kind: "click", target, x: 10, y: 20 }),
+    {
+      attempted: true,
+      executed: false,
+      execution: "unknown",
+      effect: "unknown",
+    },
+  );
+  fixture.client.callTool = async (call) => {
+    fixture.calls.push(call);
+    throw new Error("sensitive transport context");
+  };
+  await assert.rejects(
+    driver.visualExecute!({ kind: "click", target, x: 10, y: 20 }),
+    {
+      message: "Driver request failed; its outcome is unknown",
+    },
+  );
+  assert.equal(fixture.calls.length, 2);
+});
+
+void test("visual screenshots separate exact windows from native primary-display coordinates", async () => {
+  const desktop = {
+    platform: "macos",
+    display: "primary",
+    screenshot_width: 1,
+    screenshot_height: 1,
+    screen_width: 1,
+    screen_height: 1,
+    scale_factor: 1,
+  };
+  for (const selected of [
+    target,
+    { displayId: "primary" },
+  ] satisfies VisualTarget[]) {
+    const fixture = fake(visualTools(), {
+      structuredContent:
+        "displayId" in selected ? desktop : { pid: 42, window_id: 12 },
+      content: [{ type: "image", data: pngPixel, mimeType: "image/png" }],
+    });
+    const driver = await createDriver(fixture.client, session);
+    assert.deepEqual(await driver.visualScreenshot!(selected), {
+      data: pngPixel,
+      mimeType: "image/png",
+    });
+    assert.deepEqual(
+      fixture.calls[0],
+      "displayId" in selected
+        ? {
+            name: "get_desktop_state",
+            arguments: { session },
+          }
+        : {
+            name: "get_window_state",
+            arguments: {
+              pid: 42,
+              window_id: 12,
+              session,
+              include_screenshot: true,
+              include_accessibility_tree: false,
+            },
+          },
+    );
+  }
+  for (const changes of [
+    { display: "secondary" },
+    { pid: 42 },
+    { scale_factor: 0 },
+    { screenshot_width: 2 },
+  ]) {
+    const fixture = fake(visualTools(), {
+      structuredContent: { ...desktop, ...changes },
+      content: [{ type: "image", data: pngPixel, mimeType: "image/png" }],
+    });
+    const driver = await createDriver(fixture.client, session);
+    await assert.rejects(driver.visualScreenshot!({ displayId: "primary" }));
+  }
+});
+
+void test("degraded accessibility without a snapshot asks for a fresh exact-window observation", async () => {
+  await assert.rejects(
+    observePayload({ ...state(), snapshot_id: undefined, degraded: true }),
+    /window.*observe again/i,
+  );
 });

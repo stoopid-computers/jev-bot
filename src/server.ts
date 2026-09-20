@@ -27,12 +27,11 @@ export interface ReplRuntimePort {
 }
 
 const instructions =
-  "Use js with persistent JavaScript bindings. Start with one await cua.getState() or " +
+  "Use js with persistent JavaScript bindings. Start with await cua.getState() or " +
   "let app = await cua.getApp(...); the entry call returns state and API guidance. " +
-  "Use documented APIs. Batch deterministic app methods, then observe the result. " +
-  "Use app.act(goal, options) for bounded Jev action selection. The host owns planning, " +
-  "exact text, visual fallback, and authorization. Model DONE is not verified success. " +
-  "reset clears the session JavaScript bindings.";
+  "Use documented APIs and observe after input. app.act(goal, options) runs bounded Jev selection. " +
+  "The host owns planning, exact text, visual targeting, and authorization. Model DONE is not verified success. " +
+  "Visual coordinates use original PNG pixels; get a fresh screenshot after input. reset clears bindings.";
 
 function failure(message: string): CallToolResult {
   return { content: [{ type: "text", text: message }], isError: true };

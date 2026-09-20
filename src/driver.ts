@@ -6,6 +6,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv
 import { Ajv } from "ajv";
 import addFormatsModule from "ajv-formats";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "./version.js";
+import { parseKeyChord } from "./keys.js";
 
 import type {
   Driver,
@@ -13,32 +14,29 @@ import type {
   JsonObject,
   Observation,
   Target,
+  VisualTarget,
 } from "./types.js";
 
 /** The injectable MCP boundary keeps contract tests independent of a desktop. */
 export interface DriverClient {
+  /** Optional transport liveness signal. False must mean the connection closed. */
+  isConnected?(): boolean;
   listTools(input?: { cursor?: string }): Promise<unknown>;
   callTool(input: { name: string; arguments: JsonObject }): Promise<unknown>;
   close(): Promise<void>;
 }
 
+/** A closed native transport. A failed input is still unsafe to replay. */
+export class DriverConnectionError extends Error {
+  constructor() {
+    super(
+      "Driver connection closed. Observe again to reconnect; input was not retried.",
+    );
+    this.name = "DriverConnectionError";
+  }
+}
+
 const MAX_ELEMENTS = 256;
-const KEYS = new Set([
-  "return",
-  "tab",
-  "escape",
-  "space",
-  "backspace",
-  "delete",
-  "up",
-  "down",
-  "left",
-  "right",
-  "home",
-  "end",
-  "pageup",
-  "pagedown",
-]);
 const SECURE = /password|secure.?text|secure.?field/i;
 
 export function createDriverSchemaValidator(): AjvJsonSchemaValidator {
@@ -111,6 +109,11 @@ export function normalizeObservation(
   const state = object(value);
   if (state.pid !== target.pid || state.window_id !== target.windowId) {
     throw new Error("Driver observation belongs to a different window");
+  }
+  if (state.degraded === true && !state.snapshot_id) {
+    throw new Error(
+      "Exact window accessibility is unavailable. Bring the window onto the current desktop and observe again.",
+    );
   }
   const snapshotId = string(state.snapshot_id, 256);
   if (
@@ -253,13 +256,40 @@ function normalizeApps(value: JsonObject): JsonObject {
 
 function screenshotImage(
   result: unknown,
-  target: Target,
+  target: VisualTarget,
 ): { data: string; mimeType: string } {
   const { envelope, data } = structured(result);
   if (envelope.isError || !data || data.refusal || data.status === "refused") {
-    throw new Error("Driver screenshot was refused or unavailable");
+    if (data?.code === "tool_invocation_failed" && !("displayId" in target)) {
+      throw new Error(
+        "Window capture is unavailable (tool_invocation_failed). Refresh the window inventory, reselect the exact window with activate:true, and inspect a new screenshot. Do not repeat prior input without checking its effect. If capture still fails, check Screen Recording permission.",
+      );
+    }
+    throw new Error(
+      failureMessage("Driver screenshot was refused or unavailable", data),
+    );
   }
-  if (data.pid !== target.pid || data.window_id !== target.windowId) {
+  if ("displayId" in target) {
+    if (
+      data.platform !== "macos" ||
+      data.display !== "primary" ||
+      data.pid !== undefined ||
+      data.window_id !== undefined
+    ) {
+      throw new Error("Driver screenshot belongs to a different display");
+    }
+    positiveInteger(data.screenshot_width);
+    positiveInteger(data.screenshot_height);
+    positiveInteger(data.screen_width);
+    positiveInteger(data.screen_height);
+    if (
+      typeof data.scale_factor !== "number" ||
+      !Number.isFinite(data.scale_factor) ||
+      data.scale_factor <= 0
+    ) {
+      throw new Error("Driver returned an invalid display scale");
+    }
+  } else if (data.pid !== target.pid || data.window_id !== target.windowId) {
     throw new Error("Driver screenshot belongs to a different window");
   }
   if (!Array.isArray(envelope.content))
@@ -293,7 +323,39 @@ function screenshotImage(
   ) {
     throw new Error("Driver returned invalid PNG data");
   }
+  if (
+    "displayId" in target &&
+    (bytes.length < 24 ||
+      bytes.toString("ascii", 12, 16) !== "IHDR" ||
+      bytes.readUInt32BE(16) !== data.screenshot_width ||
+      bytes.readUInt32BE(20) !== data.screenshot_height)
+  ) {
+    throw new Error("Driver screenshot dimensions do not match the display");
+  }
   return { data: encoded, mimeType };
+}
+
+function visualTargetOf(value: VisualTarget): VisualTarget {
+  if ("displayId" in value) {
+    if (
+      value.displayId !== "primary" ||
+      "pid" in value ||
+      "windowId" in value
+    ) {
+      throw new Error(
+        "Visual input requires one exact window or primary display",
+      );
+    }
+    return { displayId: "primary" };
+  }
+  return targetOf(value);
+}
+
+function coordinate(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error("Visual coordinates must be finite nonnegative numbers");
+  }
+  return value;
 }
 
 function properties(schema: JsonObject): JsonObject {
@@ -351,6 +413,72 @@ function structured(result: unknown): {
   return { envelope, data };
 }
 
+// Native error text can contain private app content or arguments. Publish only
+// known codes and our own recovery text, never the provider's raw description.
+const recoveryByCode: Readonly<Record<string, string>> = {
+  off_space_or_ax_unresolved:
+    "Bring the exact window onto the current desktop, then capture it again.",
+  target_minimized: "Restore the target window, then capture it again.",
+  app_hidden: "Show the target app, then capture its exact window again.",
+  stale_element_token:
+    "Read fresh accessibility state before selecting the control again.",
+  px_window_not_found: "Refresh the window inventory and select a live window.",
+  px_capture_unavailable:
+    "Check capture permission and take a fresh window screenshot.",
+  px_frame_mismatch:
+    "Capture the exact window again before choosing new coordinates.",
+  action_outcome_mismatch:
+    "Input may have occurred. Inspect a fresh screenshot before continuing; do not replay it automatically.",
+  tool_invocation_failed:
+    "The native driver could not complete this call. Check the driver connection and permissions before continuing.",
+};
+
+function failureDetail(data?: JsonObject): {
+  code?: string;
+  recovery?: string;
+} {
+  const refusal = data?.refusal;
+  const nested =
+    refusal && typeof refusal === "object" && !Array.isArray(refusal)
+      ? object(refusal)
+      : undefined;
+  const code = nested?.code ?? data?.code;
+  if (typeof code !== "string" || !Object.hasOwn(recoveryByCode, code))
+    return {};
+  return { code, recovery: recoveryByCode[code] };
+}
+
+function failureMessage(fallback: string, data?: JsonObject): string {
+  const detail = failureDetail(data);
+  return detail.code
+    ? `${fallback} (${String(detail.code)}). ${String(detail.recovery)}`
+    : fallback;
+}
+
+function visualReceipt(result: unknown): JsonObject {
+  const { envelope, data } = structured(result);
+  const refused =
+    data?.effect === "refused" ||
+    Boolean(data?.refusal) ||
+    data?.status === "refused";
+  if (refused)
+    return {
+      attempted: false,
+      executed: false,
+      execution: "not_attempted",
+      effect: "refused",
+      ...failureDetail(data),
+    };
+  const failed = envelope.isError || !data;
+  return {
+    attempted: true,
+    executed: false,
+    execution: "unknown",
+    effect: failed ? "unknown" : "unverifiable",
+    ...(failed ? failureDetail(data) : {}),
+  };
+}
+
 function permissionsPending(envelope: JsonObject, data?: JsonObject): boolean {
   return (
     envelope.isError === true &&
@@ -381,7 +509,11 @@ export function normalizeReceipt(result: unknown): JsonObject {
     return { executed: false, stale: true, effect: "refused" };
   }
   if (envelope.isError || !data || refusal || data.status === "refused") {
-    return { executed: false, effect: "unknown" };
+    return {
+      executed: false,
+      effect: data?.effect === "refused" ? "refused" : "unknown",
+      ...failureDetail(data),
+    };
   }
   const delivery =
     data.delivery && typeof data.delivery === "object"
@@ -414,7 +546,7 @@ export function normalizeReceipt(result: unknown): JsonObject {
 
 export async function createDriver(
   client: DriverClient,
-  session = `jev-bot-${randomUUID()}`,
+  session = `Jev ${randomUUID().slice(0, 8)}`,
 ): Promise<Driver> {
   const schemas = new Map<string, JsonObject>();
   const cursors = new Set<string>();
@@ -447,9 +579,11 @@ export async function createDriver(
   }
   async function call(name: string, args: JsonObject): Promise<unknown> {
     argumentsFor(schema(name), args);
+    if (client.isConnected?.() === false) throw new DriverConnectionError();
     try {
       return await client.callTool({ name, arguments: args });
     } catch {
+      if (client.isConnected?.() === false) throw new DriverConnectionError();
       // Provider and transport errors can contain arguments or environment data.
       throw new Error("Driver request failed; its outcome is unknown");
     }
@@ -467,11 +601,83 @@ export async function createDriver(
       data.refusal ||
       data.status === "refused"
     ) {
-      throw new Error("Driver observation was refused or unavailable");
+      throw new Error(
+        failureMessage("Driver observation was refused or unavailable", data),
+      );
     }
     return data;
   }
   return {
+    async configureCursor(options) {
+      const supplied = object(options);
+      const allowed = new Set([
+        "themeId",
+        "glideDurationMs",
+        "dwellAfterClickMs",
+        "idleHideMs",
+      ]);
+      if (Object.keys(supplied).some((key) => !allowed.has(key))) {
+        throw new Error("Unsupported cursor configuration option");
+      }
+      const themeId =
+        options.themeId === undefined
+          ? undefined
+          : string(options.themeId, 200);
+      if (themeId !== undefined && !themeId.trim()) {
+        throw new Error("Cursor theme ID must not be blank");
+      }
+      const motion: JsonObject = { session, arc_size: 0, spring: 1 };
+      for (const [key, value, maximum] of [
+        ["glide_duration_ms", options.glideDurationMs, 5_000],
+        ["dwell_after_click_ms", options.dwellAfterClickMs, 5_000],
+        ["idle_hide_ms", options.idleHideMs, 60_000],
+      ] as const) {
+        if (value === undefined) continue;
+        if (
+          typeof value !== "number" ||
+          !Number.isFinite(value) ||
+          value < 0 ||
+          value > maximum
+        ) {
+          throw new Error("Cursor timing is outside its supported range");
+        }
+        motion[key] = value;
+      }
+      argumentsFor(schema("set_agent_cursor_motion"), motion);
+      const theme =
+        themeId === undefined
+          ? undefined
+          : { session, theme_id: themeId, reduced_motion: "on" };
+      if (theme) {
+        argumentsFor(schema("set_agent_cursor_theme"), theme);
+        const applied = await read("set_agent_cursor_theme", theme);
+        if (
+          applied.session !== session ||
+          object(applied.theme).id !== themeId
+        ) {
+          throw new Error(
+            "Driver did not acknowledge this session's cursor theme",
+          );
+        }
+      }
+      const applied = await read("set_agent_cursor_motion", motion);
+      const appliedMotion = object(applied.motion);
+      if (
+        applied.session !== session ||
+        Object.entries(motion).some(
+          ([key, value]) => key !== "session" && appliedMotion[key] !== value,
+        )
+      ) {
+        throw new Error(
+          "Driver did not acknowledge this session's cursor motion",
+        );
+      }
+      return {
+        configured: true,
+        session,
+        ...(themeId === undefined ? {} : { themeId }),
+      };
+    },
     async listApps() {
       const supported = properties(schema("list_apps"));
       const args = Object.hasOwn(supported, "session") ? { session } : {};
@@ -512,6 +718,138 @@ export async function createDriver(
         target,
       );
     },
+    async activate(requested) {
+      const target = targetOf(requested);
+      const { envelope, data } = structured(
+        await call("bring_to_front", {
+          pid: target.pid,
+          window_id: target.windowId,
+        }),
+      );
+      const exact = data?.exact_window_effect;
+      if (
+        envelope.isError ||
+        !data ||
+        data.pid !== target.pid ||
+        data.window_id !== target.windowId ||
+        data.status !== "activated" ||
+        data.activated !== true ||
+        !exact ||
+        typeof exact !== "object" ||
+        Array.isArray(exact) ||
+        object(exact).verified !== true ||
+        object(exact).focused !== true ||
+        object(exact).frontmost_ordinary !== true
+      ) {
+        throw new Error(
+          "Driver could not verify that the exact window is foreground",
+        );
+      }
+      return { activated: true, target };
+    },
+    async visualScreenshot(requested) {
+      const target = visualTargetOf(requested);
+      if ("displayId" in target) {
+        return screenshotImage(
+          await call("get_desktop_state", { session }),
+          target,
+        );
+      }
+      return screenshotImage(
+        await call("get_window_state", {
+          pid: target.pid,
+          window_id: target.windowId,
+          session,
+          include_screenshot: true,
+          include_accessibility_tree: false,
+        }),
+        target,
+      );
+    },
+    async visualExecute(action) {
+      const target = visualTargetOf(action.target);
+      if (action.kind === "press_key") {
+        if ("displayId" in target)
+          throw new Error("Select an exact window for keyboard input.");
+        const parsed = parseKeyChord(action.key);
+        const tool = schema("press_key");
+        background(tool);
+        const args: JsonObject = {
+          ...windowArguments(tool, target),
+          session,
+          delivery_mode: "background",
+          key: parsed.key,
+        };
+        if (parsed.modifiers.length) {
+          requireFields(tool, ["modifiers"]);
+          args.modifiers = parsed.modifiers;
+        }
+        return visualReceipt(await call("press_key", args));
+      }
+      const x = coordinate(action.x);
+      const y = coordinate(action.y);
+      if (!["click", "move", "type_text", "scroll"].includes(action.kind)) {
+        throw new Error("Unsupported visual action");
+      }
+      const name = action.kind === "move" ? "move_cursor" : action.kind;
+      const tool = schema(name);
+      let args: JsonObject;
+      if ("displayId" in target) {
+        if (action.kind !== "click" && action.kind !== "move") {
+          throw new Error(
+            "Desktop visual input supports clicks and moves only",
+          );
+        }
+        requireFields(tool, ["session", "target", "x", "y"]);
+        args = {
+          target: { kind: "desktop", display_id: "primary" },
+          session,
+          x,
+          y,
+        };
+      } else {
+        if (action.kind === "move") {
+          requireFields(tool, ["session", "target", "x", "y"]);
+          args = {
+            target: {
+              kind: "window",
+              pid: target.pid,
+              window_id: target.windowId,
+            },
+            session,
+            x,
+            y,
+          };
+        } else {
+          background(tool);
+          requireFields(tool, ["x", "y"]);
+          args = {
+            ...windowArguments(tool, target),
+            session,
+            delivery_mode: "background",
+            x,
+            y,
+          };
+        }
+      }
+      if (action.kind === "type_text") {
+        args.text = string(action.text, 8_000);
+      } else if (action.kind === "scroll") {
+        if (!["up", "down", "left", "right"].includes(action.direction)) {
+          throw new Error("Unsupported scroll direction");
+        }
+        const amount = action.amount ?? 3;
+        if (!Number.isInteger(amount) || amount < 1 || amount > 50) {
+          throw new Error("Scroll amount must be an integer from 1 to 50");
+        }
+        args.direction = action.direction;
+        args.amount = amount;
+        args.by = "line";
+      }
+      // Visual input has no independent effect proof. Never treat a transport
+      // acknowledgement or native text readback as a verified page change.
+      return visualReceipt(await call(name, args));
+    },
     async execute(action) {
       const target = targetOf(action.target);
       const tool = schema(action.kind);
@@ -530,8 +868,12 @@ export async function createDriver(
       }
       let fields: JsonObject;
       if (action.kind === "press_key") {
-        if (!KEYS.has(action.key)) throw new Error("Unsupported key");
-        fields = { key: action.key };
+        const parsed = parseKeyChord(action.key);
+        fields = { key: parsed.key };
+        if (parsed.modifiers.length) {
+          requireFields(tool, ["modifiers"]);
+          fields.modifiers = parsed.modifiers;
+        }
       } else {
         requireFields(tool, ["element_token"]);
         const token = string(action.elementToken, 256);
@@ -558,7 +900,8 @@ export async function connectDriver({
     existsSync("/Applications/CuaDriver.app/Contents/MacOS/cua-driver")
       ? "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
       : "cua-driver"),
-}: { command?: string } = {}): Promise<Driver> {
+  session,
+}: { command?: string; session?: string } = {}): Promise<Driver> {
   const transport = new StdioClientTransport({
     command,
     args: ["mcp"],
@@ -570,7 +913,15 @@ export async function connectDriver({
   );
   try {
     await client.connect(transport);
-    return await createDriver(client);
+    return await createDriver(
+      {
+        listTools: (input) => client.listTools(input),
+        callTool: (input) => client.callTool(input),
+        close: () => client.close(),
+        isConnected: () => client.transport !== undefined,
+      },
+      session,
+    );
   } catch {
     await client.close().catch(() => {});
     await transport.close().catch(() => {});

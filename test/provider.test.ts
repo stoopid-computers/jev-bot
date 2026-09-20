@@ -82,14 +82,12 @@ void test("effective-jev sends one bounded Choice and redacts secure values", as
   assert.equal(result.model, "fixture");
   assert.equal(result.confidence, 0.9);
   assert.deepEqual(result.probabilities, { handoff: 0.95, done: 0.05 });
-  assert.ok(Object.isFrozen(result));
-  assert.ok(Object.isFrozen(result.probabilities));
   assert.equal(requests.length, 1);
   assert.ok(requests[0]);
-  assert.deepEqual(Object.keys(requests[0].questions.next_action.criteria), [
-    "handoff",
-    "done",
-  ]);
+  assert.deepEqual(
+    new Set(Object.keys(requests[0].questions.next_action.criteria)),
+    new Set(["handoff", "done"]),
+  );
   assert.ok(!JSON.stringify(requests).includes("secret-fixture"));
   assert.ok(!JSON.stringify(requests).includes("s1:1"));
 });

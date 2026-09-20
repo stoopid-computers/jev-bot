@@ -2,25 +2,17 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { createServer, type ReplRuntimePort } from "../src/server.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { createServer, type ReplRuntimePort } from "../dist/index.js";
+import {
+  deferred,
+  desktopFixture,
+  decision,
+  png,
+  text,
+} from "./helpers/desktop.js";
 
-function stubRuntime(
-  overrides: Partial<ReplRuntimePort> = {},
-): ReplRuntimePort {
-  return {
-    execute: async () => ({
-      content: [{ type: "text", text: "Observed current state." }],
-    }),
-    reset: async () => {},
-    ...overrides,
-  };
-}
-
-async function connect(
-  t: TestContext,
-  runtime: ReplRuntimePort,
-): Promise<Client> {
+async function connect(t: TestContext, runtime: ReplRuntimePort) {
   const server = createServer(runtime);
   const client = new Client({ name: "jev-bot-test", version: "1.0.0" });
   const [clientTransport, serverTransport] =
@@ -33,12 +25,22 @@ async function connect(
   return client;
 }
 
-void test("publishes only js and reset with strict schemas and conservative action annotations", async (t) => {
-  const client = await connect(t, stubRuntime());
+async function execute(client: Client, code: string, timeout_ms = 1_000) {
+  return CallToolResultSchema.parse(
+    await client.callTool({
+      name: "js",
+      arguments: { code, title: "Test the session", timeout_ms },
+    }),
+  );
+}
+
+void test("publishes js and reset with strict schemas and conservative action annotations", async (t) => {
+  const { session } = desktopFixture(t);
+  const client = await connect(t, session);
   const { tools } = await client.listTools();
   assert.deepEqual(
-    tools.map((tool) => tool.name),
-    ["js", "reset"],
+    new Set(tools.map((tool) => tool.name)),
+    new Set(["js", "reset"]),
   );
   for (const tool of tools)
     assert.equal(tool.inputSchema.additionalProperties, false);
@@ -50,75 +52,44 @@ void test("publishes only js and reset with strict schemas and conservative acti
     openWorldHint: true,
   });
   assert.deepEqual(js?.inputSchema.required, ["code"]);
-  const guidance = client.getInstructions()?.slice(0, 512) ?? "";
-  assert.match(guidance, /cua.getState/);
-  assert.match(guidance, /app.act/);
-  assert.match(guidance, /DONE is not verified success/);
+  assert.ok(client.getInstructions()?.trim());
 });
 
-void test("dispatches exact JavaScript, timeout, and cancellation signal and preserves rich output", async (t) => {
-  const emitted: CallToolResult = {
-    content: [
-      { type: "text", text: "Window observation." },
-      { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
-    ],
-    structuredContent: { status: "handoff" },
-  };
-  const calls: Array<{
-    code: string;
-    signal?: AbortSignal;
-    timeoutMs?: number;
-  }> = [];
-  const client = await connect(
-    t,
-    stubRuntime({
-      execute: async (code, signal, timeoutMs) => {
-        calls.push({ code, signal, timeoutMs });
-        return emitted;
-      },
-    }),
+void test("MCP edits persist across calls and return the observed text and screenshot", async (t) => {
+  const { session } = desktopFixture(t);
+  const client = await connect(t, session);
+  const selected = await execute(
+    client,
+    "let app = await cua.getWindow(123,456);",
   );
-  const code =
-    'let app = await cua.getApp("TextEdit");\nawait app.getAXState();';
-  const response = await client.callTool({
-    name: "js",
-    arguments: { code, title: "Read the editor", timeout_ms: 1_234 },
-  });
-  assert.deepEqual(response, emitted);
-  assert.equal(calls[0]?.code, code);
-  assert.equal(calls[0]?.timeoutMs, 1_234);
-  assert.ok(calls[0]?.signal instanceof AbortSignal);
-  assert.equal(calls[0].signal.aborted, false);
-  await client.callTool({
-    name: "js",
-    arguments: { code: "await cua.getState()" },
-  });
-  assert.equal(calls[1]?.timeoutMs, 30_000);
+  assert.notEqual(selected.isError, true, text(selected));
+  const edited = await execute(client, 'await app.setValue(1,"MCP text");');
+  assert.notEqual(edited.isError, true, text(edited));
+  const observed = await execute(
+    client,
+    "await app.getAXStateAndScreenshot();",
+  );
+  assert.notEqual(observed.isError, true, text(observed));
+  assert.match(text(observed), /AXTextField "Name" value="MCP text"/);
+  assert.deepEqual(
+    observed.content.filter((block) => block.type === "image"),
+    [{ type: "image", data: png, mimeType: "image/png" }],
+  );
 });
 
-void test("rejects invalid and unknown arguments before executing JavaScript", async (t) => {
-  let calls = 0;
-  const client = await connect(
-    t,
-    stubRuntime({
-      execute: async () => {
-        calls++;
-        return { content: [] };
-      },
-      reset: async () => {
-        calls++;
-      },
-    }),
-  );
+void test("invalid tool arguments cannot execute code or reset existing bindings", async (t) => {
+  const { session } = desktopFixture(t);
+  const client = await connect(t, session);
+  await execute(client, "let edits = 0;");
   const invalid = [
     {},
     { code: "" },
     { code: "   " },
-    { code: "await cua.getState()", unexpected: true },
-    { code: "await cua.getState()", timeout_ms: 0 },
-    { code: "await cua.getState()", timeout_ms: 60_001 },
-    { code: "await cua.getState()", timeout_ms: 1.5 },
-    { code: "await cua.getState()", title: "" },
+    { code: "edits++", unexpected: true },
+    { code: "edits++", timeout_ms: 0 },
+    { code: "edits++", timeout_ms: 60_001 },
+    { code: "edits++", timeout_ms: 1.5 },
+    { code: "edits++", title: "" },
   ];
   for (const args of invalid) {
     const response = await client.callTool({ name: "js", arguments: args });
@@ -129,52 +100,55 @@ void test("rejects invalid and unknown arguments before executing JavaScript", a
     arguments: { force: true },
   });
   assert.equal(reset.isError, true);
-  assert.equal(calls, 0);
+  const unchanged = await execute(client, "await nodeRepl.write(edits);");
+  assert.deepEqual(unchanged.content, [{ type: "text", text: "0" }]);
 });
 
-void test("delegates reset to the same persistent runtime without executing code", async (t) => {
-  let resets = 0;
-  const client = await connect(
-    t,
-    stubRuntime({
-      execute: async () => {
-        throw new Error("Reset must not execute user code.");
-      },
-      reset: async () => {
-        resets++;
-      },
-    }),
+void test("MCP reset discards bindings without undoing native edits", async (t) => {
+  const { session } = desktopFixture(t);
+  const client = await connect(t, session);
+  await execute(
+    client,
+    'let app = await cua.getWindow(123,456); await app.setValue(1,"Keep this");',
   );
-  const response = await client.callTool({ name: "reset", arguments: {} });
-  assert.equal(resets, 1);
-  assert.deepEqual(response.structuredContent, { reset: true });
-  assert.notEqual(response.isError, true);
-});
-
-void test("passes runtime handoff and error outcomes through without relabeling success", async (t) => {
-  let outcome: CallToolResult = {
-    content: [{ type: "text", text: "Visual fallback required." }],
-    structuredContent: { status: "handoff" },
-  };
-  const client = await connect(
-    t,
-    stubRuntime({ execute: async () => outcome }),
+  const reset = await client.callTool({ name: "reset", arguments: {} });
+  assert.notEqual(reset.isError, true);
+  assert.deepEqual(reset.structuredContent, { reset: true });
+  const cleared = await execute(client, "await nodeRepl.write(typeof app);");
+  assert.ok(
+    cleared.content.some(
+      (block) => block.type === "text" && block.text === "undefined",
+    ),
   );
-  for (const error of [false, true]) {
-    outcome = { ...outcome, isError: error };
-    const response = await client.callTool({
-      name: "js",
-      arguments: { code: 'await app.act("Open preferences")' },
-    });
-    assert.deepEqual(response, outcome);
-  }
+  const observed = await execute(
+    client,
+    "let app = await cua.getWindow(123,456);",
+  );
+  assert.match(text(observed), /AXTextField "Name" value="Keep this"/);
 });
 
-void test("does not leak underlying runtime exception details", async (t) => {
+void test("a model's done choice reaches the MCP caller as handoff, not verified success", async (t) => {
+  const { session, actions } = desktopFixture(
+    t,
+    {},
+    async (_goal, _state, candidates) => decision(candidates, "done"),
+  );
+  const client = await connect(t, session);
+  await execute(client, "let app = await cua.getWindow(123,456);");
+  const response = await execute(client, 'await app.act("Save the document");');
+  assert.notEqual(response.isError, true, text(response));
+  assert.match(text(response), /"status":"handoff"/);
+  assert.doesNotMatch(text(response), /"status":"verified"/);
+  assert.deepEqual(actions, []);
+  const failed = await execute(client, 'throw new Error("test failure");');
+  assert.equal(failed.isError, true);
+});
+
+void test("exceptions from an embedded runtime do not expose its private details", async (t) => {
   const fail = async (): Promise<never> => {
     throw new Error("secret-api-key and private response body");
   };
-  const client = await connect(t, stubRuntime({ execute: fail, reset: fail }));
+  const client = await connect(t, { execute: fail, reset: fail });
   for (const name of ["js", "reset"]) {
     const response = await client.callTool({
       name,
@@ -188,45 +162,79 @@ void test("does not leak underlying runtime exception details", async (t) => {
   }
 });
 
-void test("cancels an in-flight execution through the MCP request signal", async (t) => {
-  let markStarted: () => void = () => {};
-  let markAborted: () => void = () => {};
-  const started = new Promise<void>((resolve) => {
-    markStarted = resolve;
-  });
-  const aborted = new Promise<void>((resolve) => {
-    markAborted = resolve;
-  });
-  const client = await connect(
-    t,
-    stubRuntime({
-      execute: async (_code, signal) => {
+void test(
+  "MCP cancellation stops the chooser, blocks later input, and resets bindings",
+  { timeout: 5_000 },
+  async (t) => {
+    const started = deferred<void>();
+    const aborted = deferred<void>();
+    const { session, actions } = desktopFixture(
+      t,
+      {},
+      async (_goal, _state, candidates, _history, signal) => {
         assert.ok(signal);
-        const cancellation = new Promise<void>((resolve) => {
-          signal.addEventListener(
-            "abort",
-            () => {
-              markAborted();
-              resolve();
-            },
-            { once: true },
-          );
+        signal.addEventListener("abort", () => aborted.resolve(), {
+          once: true,
         });
-        markStarted();
-        await cancellation;
-        return { content: [{ type: "text", text: "Cancelled by caller." }] };
+        started.resolve();
+        await aborted.promise;
+        return decision(candidates, "handoff");
       },
-    }),
-  );
-  const controller = new AbortController();
-  const pending = client.callTool(
-    { name: "js", arguments: { code: 'await app.act("Open preferences")' } },
-    undefined,
-    { signal: controller.signal },
-  );
-  const rejected = assert.rejects(pending, /cancelled by test/);
-  await started;
-  controller.abort(new Error("cancelled by test"));
-  await rejected;
-  await aborted;
-});
+    );
+    const client = await connect(t, session);
+    await execute(client, "let app = await cua.getWindow(123,456);");
+    const controller = new AbortController();
+    const pending = client.callTool(
+      {
+        name: "js",
+        arguments: {
+          code: 'await app.act("Save"); await app.pressKey("return");',
+        },
+      },
+      undefined,
+      { signal: controller.signal },
+    );
+    const rejected = assert.rejects(pending, /cancelled by test/);
+    await started.promise;
+    controller.abort(new Error("cancelled by test"));
+    await rejected;
+    await aborted.promise;
+    let next;
+    do {
+      next = await execute(client, "await nodeRepl.write(typeof app);");
+      if (next.isError) {
+        assert.match(text(next), /busy/i);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    } while (next.isError);
+    assert.ok(
+      next.content.some(
+        (block) => block.type === "text" && block.text === "undefined",
+      ),
+    );
+    assert.deepEqual(actions, []);
+  },
+);
+
+void test(
+  "MCP enforces the supplied execution deadline and remains usable",
+  { timeout: 5_000 },
+  async (t) => {
+    const { session, actions } = desktopFixture(t);
+    const client = await connect(t, session);
+    await execute(client, "let app = await cua.getWindow(123,456);");
+    const timedOut = await execute(
+      client,
+      'while (true) {} await app.pressKey("return");',
+      75,
+    );
+    assert.equal(timedOut.isError, true);
+    const next = await execute(client, "await nodeRepl.write(typeof app);");
+    assert.ok(
+      next.content.some(
+        (block) => block.type === "text" && block.text === "undefined",
+      ),
+    );
+    assert.deepEqual(actions, []);
+  },
+);

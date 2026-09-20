@@ -11,10 +11,18 @@ Node.js 22+ or Bun 1.4.2+. Native desktop control requires macOS.
 [Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
 [Development](#development) · [Releases](#releases) · [Attribution](#attribution-and-license)
 
-Supports app discovery, accessibility reads, screenshots, clicks, text replacement,
-typing, and navigation keys. This first version follows Codex's CUA interaction
-pattern. Browser tabs, coordinate clicks, dragging, scrolling, clipboard paste,
-app launching, and keyboard shortcuts are not implemented.
+Version **0.1.3** adds screenshot-based clicks, typing, scrolling, cursor movement,
+explicit window activation, and keyboard shortcuts. Accessibility reads and
+numbered controls remain available alongside visual input.
+
+Visual methods require Cua Driver to advertise the matching window, coordinate,
+and background-input contracts. Unsupported drivers return an error before input.
+The independent hover cursor was tested with a patched local CuaDriver build;
+those native patches and the compact cursor theme are installed separately.
+See [visual usage](#use-screenshot-coordinates) for the workflow and limitations.
+
+Browser tab/DOM APIs, dragging, clipboard paste, and app launching remain
+unimplemented.
 
 ## Quick start
 
@@ -169,6 +177,39 @@ happen in sequence. Jev receives text, while your agent interprets the screensho
 Call the MCP **`reset` tool** with `{}` to discard variables and app selections.
 It does not undo changes in the app.
 
+### Use screenshot coordinates
+
+Use version 0.1.3 or later and restart its MCP connection after upgrading. Your
+agent reads screenshots and chooses each point; visual actions do not call Jev.
+
+Select one running app and bring its window forward:
+
+```js
+let browser = await cua.getApp("Helium", { mode: "visual", activate: true });
+```
+
+This displays the initial screenshot and its pixel dimensions. If the app has
+several titled windows, select one from `cua.getState()` using
+`cua.getWindow(pid, windowId, { mode: "visual", activate: true })`.
+
+In the next call, use a point observed in that screenshot. The coordinates below
+are examples, not a target to reuse:
+
+```js
+await browser.click([420, 260]);
+await browser.getScreenshot();
+```
+
+Use the **original PNG pixels**, even if your client displays a smaller preview.
+Read and inspect a fresh screenshot after every action before choosing the next
+point. Window input targets the selected window in the background and leaves the
+hardware pointer in place. Browser-native tooltips can still appear beside the
+hardware pointer because the browser shares macOS tooltip state. This native-only
+implementation does not isolate that state.
+An action receipt does not prove the intended change; uncertain input is never
+automatically retried. See the [visual API reference](#visual-controls)
+for shortcuts, typing, scrolling, and cursor configuration.
+
 ## API reference
 
 All JavaScript methods are asynchronous. **Await every call and run UI actions
@@ -239,6 +280,10 @@ Ordinary JavaScript errors preserve variables. A timeout, cancellation, or crash
 clears them. Input already sent to an app may have happened; select the
 window and inspect it before continuing.
 
+A read retries once with a fresh native connection only when its transport is
+confirmed closed. Permission refusals do not trigger reconnects. Input and window
+activation are never replayed automatically. `close()` is final.
+
 ### Find apps and windows
 
 | Method                         | Returns             | Details                                                                           |
@@ -248,11 +293,77 @@ window and inspect it before continuing.
 | `cua.getApp(nameOrBundleId)`   | App handle          | Matches one running app by exact name or bundle ID. Requires one visible window.  |
 | `cua.getWindow(pid, windowId)` | App handle          | Selects an exact window using positive integer IDs from the inventory.            |
 
-An app handle is the object stored in `app` in the examples. Selecting an app or
-window always displays its initial full accessibility state. Inventory calls
-display output by default; pass `{ emit: false }` to keep only the return value.
+An app handle is the object stored in `app` in the examples. In the default
+accessibility mode, selection displays the initial full accessibility state.
+Inventory calls display output by default; pass `{ emit: false }` to keep only
+the return value.
 Window entries include `pid`, `window_id`, `app_name`, `title`, and `is_on_screen`.
 Select a visible window with a non-null `pid`.
+
+### Visual controls
+
+These methods are available in 0.1.3 and require matching Cua Driver capabilities.
+Existing accessibility methods keep their behavior.
+
+| Method                                                             | Returns               | Behavior                                                                                                                                                                                                            |
+| ------------------------------------------------------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cua.getApp(nameOrBundleId, { mode: "visual", activate: true })`   | Visual handle         | Selects one running app's single titled window, brings it forward, and displays a screenshot. Use an explicit window if ambiguous.                                                                                  |
+| `cua.getWindow(pid, windowId, { mode: "visual", activate: true })` | Visual handle         | Selects and activates the exact observed window, then displays a screenshot.                                                                                                                                        |
+| `visual.getScreenshot({ emit?, settleMs? }?)`                      | `Uint8Array`          | Displays a PNG and its original pixel dimensions; refreshes the frame used for input. `emit` defaults to `true`.                                                                                                    |
+| `visual.move([x, y])`                                              | Receipt               | Hovers the selected window with the agent cursor, leaving the hardware pointer in place. Requires the patched local CuaDriver; confirm the visible result.                                                          |
+| `visual.click([x, y])`                                             | Receipt               | Clicks once with the left button at the observed point.                                                                                                                                                             |
+| `visual.typeText(text, { at: [x, y] })`                            | Receipt               | Clicks the observed field and inserts the supplied text at its caret or selection. Accepts 1–8,000 characters.                                                                                                      |
+| `visual.pressKey(key)`                                             | Receipt               | Sends one key or chord, such as `Cmd+K`, to the exact window in the background. Requires a fresh screenshot. Desktop keyboard input is unsupported.                                                                 |
+| `visual.scroll([x, y], direction, amount?)`                        | Receipt               | Scrolls at the observed point. Direction is `up`, `down`, `left`, or `right`; amount is an integer from 1 to 50, default 3.                                                                                         |
+| `cua.getDesktop()`                                                 | Desktop visual handle | Displays the primary display for OS controls such as the menu bar. Supports `getScreenshot`, `click`, and `move`. Desktop movement changes the real pointer. Select a window when the cursor must stay independent. |
+
+Selection options are `mode: "accessibility" | "visual"` and `activate: boolean`.
+Defaults are accessibility mode and no activation. Visual handles support the
+methods above; use an accessibility handle for element indices, `setValue`, or `act`.
+
+Coordinates must be inside the latest screenshot and use its original PNG
+pixels. Every action invalidates the captured frames. Call `getScreenshot()`
+again before selecting another point. Your agent supplies visual targeting and
+checks the result; Jev still selects only native accessibility actions.
+
+Visual receipts distinguish refusal from uncertain delivery. A known refusal
+reports `attempted: false`, `executed: false`, `execution: "not_attempted"`, and
+`effect: "refused"`. Known driver errors include a safe `code` and `recovery`
+message. An uncertain attempt reports `attempted: true`, `executed: false`, and
+`execution: "unknown"`. Inspect a fresh screenshot before continuing. No receipt
+alone proves the requested UI change.
+
+After a hover, capture waits until at least 100 ms have elapsed since the move
+finished, giving the app time to paint. Time spent between calls counts toward
+this interval. `settleMs` accepts integers from 0 to 1,000; use `0` to capture
+immediately. Other actions add no such delay.
+
+Configure motion through the same MCP session:
+
+```js
+await cua.configureCursor({
+  glideDurationMs: 120,
+  dwellAfterClickMs: 0,
+  idleHideMs: 1500,
+});
+```
+
+This changes only the connection's cursor and sends no input. Optional `themeId`
+selects an already-installed Cua theme. Glide and click dwell accept 0–5,000 ms;
+idle visibility accepts 0–60,000 ms. Zero glide uses the driver's speed-based
+motion. The local alpha uses `com.compootor.jev.compact`, an approximately 23-point
+adaptation of Cua's cursor. That theme and the patched native driver are not part
+of the published package. Configure again after reconnecting.
+
+Build local CuaDriver candidates with `--release`. On this Mac, optimized window
+captures took 119–157 ms; the debug build took 5.15–5.21 seconds. These are local
+samples, not a cross-machine performance guarantee.
+
+For embedded adapters, `Driver` adds optional `activate`, `visualScreenshot`,
+`visualExecute`, and `configureCursor` methods. The root exports `VisualTarget` for an exact window
+or `{ displayId: "primary" }`, and `VisualAction` for move, click, text, scroll,
+or exact-window key input.
+Adapters without these methods retain accessibility support.
 
 ### Read a window
 
@@ -285,12 +396,18 @@ Password fields and controls inside web content are excluded.
 
 Direct input invalidates element numbers. Jev methods read state themselves and
 return the latest observation when available. `typeText` rereads its selected
-field and requires a unique role/label match. Jev calls and `pressKey` clear that
-field selection.
+field and requires a unique role/label match. Jev calls and focus-changing keys
+clear that selection. Caret movement and deletion preserve it, including Shift
+and Option modifiers, so you can move the caret and continue typing.
 
 Supported keys: `return`, `tab`, `escape`, `space`, `backspace`, `delete`, `up`,
 `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`.
-`pressKey` ignores case. Key combinations such as `Cmd+S` are unsupported.
+Direct `pressKey` also accepts letters, digits, F1–F12, and chords such as
+`Cmd+K` or `Cmd+Shift+S`. Modifiers are Cmd, Ctrl, Option, Shift, and Fn;
+Command/Meta, Control, and Alt are aliases. Enter and Esc alias Return and Escape.
+Names ignore case. Pass one key or chord per call, not a sequence. Direct shortcuts
+are available in 0.1.3. Jev's `act({ keys })` remains limited
+to the lowercase navigation/editing list above.
 
 ### Work toward a goal
 
@@ -486,7 +603,8 @@ the command skips without opening an app or calling TypeSafe.
 - Cua Driver 0.28.2 was installed with its published checksum and app signature verified.
 - One live `jev-1.13.0` request through Effective Jev selected the expected action from synthetic window data. It performed no desktop input. No desktop performance benchmark has been run.
 - The smoke runner passed TypeScript checking; its Swift fixture passed compiler typechecking.
-- The native smoke attempt stopped at the macOS permission check. Real typing, clicking, screenshots, and invocation from ChatGPT remain unverified.
+- A fresh Codex CLI session using published `0.1.2` replaced a native fixture field, clicked Submit, and captured its screenshot. An independent receipt confirmed the exact text and one click. Stale-index rejection and reset worked; Jev selection and window recovery did not complete. See the [computer-use review](https://github.com/stoopid-computers/jev-bot/blob/release/0.1/COMPUTER_USE_REVIEW.md) for measured results and limitations.
+- The 0.1.3 candidate completed hover, search, thread selection, scrolling, a theme change, new-chat creation, and prompt submission in Helium through the custom MCP. One capture interruption needed explicit window recovery. These tests used a patched local native driver; they do not prove an uninterrupted recorded demo or stock-driver parity. ChatGPT desktop invocation remains unverified.
 
 </details>
 

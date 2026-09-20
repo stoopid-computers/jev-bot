@@ -20,4 +20,6 @@ export type {
   RunRequest,
   RunResult,
   Target,
+  VisualAction,
+  VisualTarget,
 } from "./types.js";
